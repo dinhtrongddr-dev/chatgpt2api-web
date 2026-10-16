@@ -268,11 +268,21 @@ def account_row(
     user_id = _text(account.get("user_id"))
     enabled = backend_category != "disabled"
     enabled_action = "disable" if enabled else "enable"
+    raw_restore = account.get("restore_at")
+    raw_created = account.get("created_at")
     return {
         "id": account_id,
         "email": email,
         "user_id": user_id,
         "display_name": email or user_id or account_id,
+        "status": status_label,
+        "access_token": access_token,
+        "type": plan_label or plan or "Plus",
+        "source_type": source,
+        "quota": quota_remaining,
+        "restore_at": raw_restore or "",
+        "success": max(0, int(account.get("success") or 0)),
+        "fail": max(0, int(account.get("fail") or 0)),
         "plan": plan,
         "plan_label": plan_label,
         "source": source,
