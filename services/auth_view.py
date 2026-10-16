@@ -17,6 +17,9 @@ def build_auth_view(app_version: str, identity: Mapping[str, object] | None = No
             subject=None,
             capabilities=AuthCapabilities(),
             home_route="/login",
+            role=None,
+            subject_id=None,
+            name=None,
         )
 
     raw_role = _clean(identity.get("role")).lower()
@@ -31,4 +34,7 @@ def build_auth_view(app_version: str, identity: Mapping[str, object] | None = No
         subject=AuthSubject(id=subject_id, name=subject_name, role=role),
         capabilities=AuthCapabilities(admin_console=is_admin, studio=True),
         home_route="/" if is_admin else "/studio",
+        role=role,
+        subject_id=subject_id,
+        name=subject_name,
     )

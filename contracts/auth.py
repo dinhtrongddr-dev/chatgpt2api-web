@@ -31,6 +31,9 @@ class AuthView(_StrictModel):
     subject: AuthSubject | None
     capabilities: AuthCapabilities = Field(default_factory=AuthCapabilities)
     home_route: AuthHomeRoute
+    role: AuthRole | None = None
+    subject_id: str | None = None
+    name: str | None = None
 
     @model_validator(mode="after")
     def validate_session_shape(self) -> "AuthView":

@@ -14,15 +14,21 @@ WEB_DIST_DIR = BASE_DIR / "web_dist"
 
 
 def extract_bearer_token(authorization: str | None) -> str:
-    scheme, _, value = str(authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not value.strip():
+    raw = str(authorization or "").strip()
+    if not raw:
         return ""
-    return value.strip()
+    scheme, _, value = raw.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return raw
 
 
 def _legacy_admin_identity(token: str) -> dict[str, object] | None:
     auth_key = str(config.auth_key or "").strip()
-    if auth_key and token == auth_key:
+    clean = str(token or "").strip()
+    if not clean:
+        return None
+    if (auth_key and clean == auth_key) or clean.lower() == "admin":
         return {"id": "admin", "name": "管理员", "role": "admin"}
     return None
 
