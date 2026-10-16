@@ -10,11 +10,10 @@ from services.protocol.conversation import (
     ConversationRequest,
     collect_image_outputs,
     conversation_events,
-    stream_codex_image_outputs,
     stream_image_outputs,
 )
 from utils.diagnostics import sanitize_diagnostic_text
-from utils.helper import build_chat_image_markdown_content, is_codex_image_model
+from utils.helper import build_chat_image_markdown_content
 
 
 def _account_label(account: dict[str, object], account_id: str) -> str:
@@ -194,11 +193,7 @@ class AccountTestService:
                     call_id=call_id,
                     trace_image_perf=trace_image_perf,
                 )
-                stream = (
-                    stream_codex_image_outputs
-                    if is_codex_image_model(model)
-                    else stream_image_outputs
-                )
+                stream = stream_image_outputs
                 result = collect_image_outputs(stream(backend, request))
             finally:
                 if backend is not None:

@@ -92,20 +92,7 @@ def _image_models_from_accounts(accounts: list[dict[str, Any]]) -> list[str]:
     if not available_accounts:
         return []
 
-    models = list(WEB_IMAGE_MODELS)
-    codex_types = {
-        normalized
-        for account in available_accounts
-        if account_service._normalize_source_type(account.get("source_type")) == "codex"
-        and (normalized := account_service._normalize_account_type(account.get("type")))
-    }
-
-    if codex_types & {"Plus", "Team", "Pro"}:
-        models.append(CODEX_IMAGE_MODEL)
-    for plan_type in ("Plus", "Team", "Pro"):
-        if plan_type in codex_types:
-            models.append(f"{plan_type.lower()}-{CODEX_IMAGE_MODEL}")
-    return models
+    return list(WEB_IMAGE_MODELS)
 
 
 def _unique(values: list[str]) -> list[str]:
