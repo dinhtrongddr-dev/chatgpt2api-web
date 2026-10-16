@@ -30,6 +30,13 @@ _STATUS_LABEL: dict[AccountStatusCategory, str] = {
     "disabled": "Đã tắt",
 }
 
+_CANONICAL_STATUS: dict[AccountStatusCategory, str] = {
+    "normal": "正常",
+    "limited": "限流",
+    "abnormal": "异常",
+    "disabled": "禁用",
+}
+
 _STATUS_TONE: dict[AccountStatusCategory, PresentationTone] = {
     "normal": "success",
     "limited": "warning",
@@ -275,13 +282,18 @@ def account_row(
     enabled_action = "disable" if enabled else "enable"
     raw_restore = account.get("restore_at")
     raw_created = account.get("created_at")
+    canonical_status = _CANONICAL_STATUS.get(category, "正常")
     return {
         "id": account_id,
         "email": email,
         "user_id": user_id,
         "display_name": email or user_id or account_id,
-        "status": status_label,
+        "status": canonical_status,
+        "status_label": status_label,
+        "status_category": category,
+        "status_tone": status_tone,
         "access_token": access_token,
+        "accessToken": access_token,
         "type": plan_label or plan or "Plus",
         "source_type": source,
         "quota": quota_remaining,
@@ -293,7 +305,8 @@ def account_row(
         "source": source,
         "source_label": source_label,
         "source_plan_label": f"{source_label} / {plan_label}",
-        "backend_status": _STATUS_LABEL[backend_category],
+        "backend_status": canonical_status,
+        "backend_status_label": _STATUS_LABEL[backend_category],
         "status_category": category,
         "status_label": status_label,
         "status_tone": status_tone,
