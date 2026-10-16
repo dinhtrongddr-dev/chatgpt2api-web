@@ -5,13 +5,8 @@ from typing import Any
 
 def normalize_thinking_effort(value: object) -> str:
     normalized = str(value or "").strip().lower()
-    if normalized in {"", "none"}:
-        return ""
-    if normalized in {"low", "medium", "high"}:
-        return normalized
-    # ChatGPT Web exposes the top tier as ``extended``. Keep accepting the
-    # OpenAI-compatible ``xhigh``/``max`` spellings so callers do not silently
-    # lose the requested reasoning level before the Web request is built.
+    # ChatGPT Web conduit upstream strictly accepts either "extended" or omitted.
+    # Passing "low", "medium", "high" triggers 422 Unprocessable Entity from upstream.
     if normalized in {"xhigh", "extended", "max"}:
         return "extended"
     return ""
