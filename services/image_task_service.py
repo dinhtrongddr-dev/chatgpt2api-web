@@ -319,13 +319,20 @@ class ImageTaskService:
 
     def _cleanup_stale_spool_roots_locked(self) -> None:
         prefix = f"{self.path.stem}-"
-        for candidate in self._spool_parent.iterdir():
-            if not candidate.is_dir() or not candidate.name.startswith(prefix):
-                continue
-            owner_path = candidate / SPOOL_OWNER_LOCK_NAME
-            if not owner_path.is_file():
-                # Roots created before ownership locks cannot be distinguished from
-                # a live older process, so leave them untouched.
+        try:
+            candidates = list(self._spool_parent.iterdir())
+        except OSError:
+            return
+        for candidate in candidates:
+            try:
+                if not candidate.is_dir() or not candidate.name.startswith(prefix):
+                    continue
+                owner_path = candidate / SPOOL_OWNER_LOCK_NAME
+                if not owner_path.is_file():
+                    # Roots created before ownership locks cannot be distinguished from
+                    # a live older process, so leave them untouched.
+                    continue
+            except OSError:
                 continue
             owner_probe = interprocess_lock(owner_path, timeout_seconds=0)
             try:
@@ -342,7 +349,7 @@ class ImageTaskService:
             else:
                 owner_probe.__exit__(None, None, None)
             try:
-                shutil.rmtree(candidate)
+                shutil.rmtree(candidate, ignore_errors=True)
             except OSError as exc:
                 logger.warning({
                     "event": "image_task_stale_spool_cleanup_failed",

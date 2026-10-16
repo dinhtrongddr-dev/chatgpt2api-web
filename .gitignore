@@ -60,5 +60,6 @@ runtime/
 .vscode/
 *.swp
 *.swo
-.DS_Store
-Thumbs.db
+# Local Service Scripts
+service.cmd
+service.vbs
