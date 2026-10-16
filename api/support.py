@@ -29,7 +29,7 @@ def _legacy_admin_identity(token: str) -> dict[str, object] | None:
     if not clean:
         return None
     if (auth_key and clean == auth_key) or clean.lower() == "admin":
-        return {"id": "admin", "name": "管理员", "role": "admin"}
+        return {"id": "admin", "name": "admin", "role": "admin"}
     return None
 
 
@@ -37,7 +37,7 @@ def require_identity(authorization: str | None) -> dict[str, object]:
     token = extract_bearer_token(authorization)
     identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
     if identity is None:
-        raise HTTPException(status_code=401, detail={"error": "密钥无效或已失效，请重新登录"})
+        raise HTTPException(status_code=401, detail={"error": "Mã khóa không hợp lệ hoặc đã hết hạn, vui lòng đăng nhập lại"})
     return identity
 
 
@@ -48,7 +48,7 @@ def require_auth_key(authorization: str | None) -> None:
 def require_admin(authorization: str | None) -> dict[str, object]:
     identity = require_identity(authorization)
     if identity.get("role") != "admin":
-        raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
+        raise HTTPException(status_code=403, detail={"error": "Yêu cầu quyền Quản trị viên để thực hiện thao tác này"})
     return identity
 
 

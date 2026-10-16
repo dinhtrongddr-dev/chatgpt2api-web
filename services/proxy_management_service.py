@@ -110,20 +110,20 @@ def project_proxy_assignment(
 
     lowered = raw.lower()
     if not raw:
-        return ProxyAssignmentProjection(raw, "inherit", "", "使用默认出口")
+        return ProxyAssignmentProjection(raw, "inherit", "", "Proxy mặc định")
     if lowered == "direct":
-        return ProxyAssignmentProjection(raw, "direct", "", "强制直连")
+        return ProxyAssignmentProjection(raw, "direct", "", "Kết nối trực tiếp")
     if lowered.startswith("group:"):
         group_id = _group_reference_id(raw)
         group_name = _clean_text((group_names or {}).get(group_id)) or group_id or "-"
-        return ProxyAssignmentProjection(raw, "group", group_id, f"代理组：{group_name}")
+        return ProxyAssignmentProjection(raw, "group", group_id, f"Nhóm proxy: {group_name}")
     if lowered.startswith("profile:"):
         profile_id = _clean_text(raw.split(":", 1)[1])
         return ProxyAssignmentProjection(
             raw,
             "profile",
             "",
-            f"历史代理：{profile_id or '-'}",
+            f"Lịch sử proxy: {profile_id or '-'}",
         )
     return ProxyAssignmentProjection(raw, "custom", "", _custom_proxy_display(raw))
 

@@ -16,13 +16,18 @@ _STATUS_CATEGORY: dict[str, AccountStatusCategory] = {
     "限流": "limited",
     "异常": "abnormal",
     "禁用": "disabled",
+    "Hoạt động": "normal",
+    "Bình thường": "normal",
+    "Bị giới hạn": "limited",
+    "Bị lỗi": "abnormal",
+    "Đã tắt": "disabled",
 }
 
 _STATUS_LABEL: dict[AccountStatusCategory, str] = {
-    "normal": "正常",
-    "limited": "限流",
-    "abnormal": "异常",
-    "disabled": "禁用",
+    "normal": "Hoạt động",
+    "limited": "Bị giới hạn",
+    "abnormal": "Bị lỗi",
+    "disabled": "Đã tắt",
 }
 
 _STATUS_TONE: dict[AccountStatusCategory, PresentationTone] = {
@@ -33,21 +38,21 @@ _STATUS_TONE: dict[AccountStatusCategory, PresentationTone] = {
 }
 
 _ACCESS_TOKEN_PRESENTATION = {
-    "valid": ("AT 有效", "success"),
-    "expiring": ("AT 临期", "warning"),
-    "invalid": ("AT 失效", "error"),
+    "valid": ("AT Hợp lệ", "success"),
+    "expiring": ("AT Sắp hết hạn", "warning"),
+    "invalid": ("AT Hết hạn", "error"),
 }
 
 _REFRESH_TOKEN_PRESENTATION = {
-    "valid": ("RT 有效", "success"),
-    "missing": ("RT 缺失", "neutral"),
-    "invalid": ("RT 失效", "error"),
+    "valid": ("RT Hợp lệ", "success"),
+    "missing": ("RT Thiếu", "neutral"),
+    "invalid": ("RT Hết hạn", "error"),
 }
 
 _CREDENTIAL_AVAILABILITY_PRESENTATION = {
-    "usable": ("可用", "success"),
-    "recoverable": ("可恢复", "warning"),
-    "unavailable": ("不可用", "error"),
+    "usable": ("Khả dụng", "success"),
+    "recoverable": ("Có thể hồi phục", "warning"),
+    "unavailable": ("Không khả dụng", "error"),
 }
 
 _PLAN_LABELS = {
@@ -141,7 +146,7 @@ def _diagnostic(value: object, account: dict[str, Any], limit: int = 500) -> str
 def _plan(account: dict[str, Any]) -> tuple[str, str]:
     raw = _text(account.get("type"))
     key = raw.lower().replace("-", "").replace("_", "").replace(" ", "")
-    return raw, _PLAN_LABELS.get(key, raw or "未知")
+    return raw, _PLAN_LABELS.get(key, raw or "Chưa rõ")
 
 
 def _source(account: dict[str, Any]) -> tuple[str, str]:
@@ -182,21 +187,21 @@ def _status(
     )
 
     if backend_category == "disabled":
-        reason_code, reason = "disabled", "账号已手动禁用"
+        reason_code, reason = "disabled", "Tài khoản đã bị tạm dừng"
     elif backend_category == "abnormal":
-        reason_code, reason = "auth_invalid", "远程确认账号登录态已失效"
+        reason_code, reason = "auth_invalid", "Tài khoản đã hết hạn đăng nhập"
     elif category == "abnormal":
-        reason_code, reason = "credentials_unavailable", "AT 已失效，且没有可用 RT，账号无法参与调度"
+        reason_code, reason = "credentials_unavailable", "AT hết hạn và không có RT khôi phục"
     elif backend_category == "limited":
-        reason_code, reason = "image_quota_exhausted", "远程确认图片额度已用完"
+        reason_code, reason = "image_quota_exhausted", "Hạn mức tài khoản đã hết"
     elif remote_result == "pending":
-        reason_code, reason = "verification_pending", "正在核验账号状态"
+        reason_code, reason = "verification_pending", "Đang kiểm tra tài khoản..."
     elif remote_result == "error" or raw_error:
-        reason_code, reason = "remote_check_failed", "最近一次账号检测失败，尚未确认账号失效"
+        reason_code, reason = "remote_check_failed", "Kiểm tra gần nhất lỗi, chưa xác nhận hỏng"
     elif credential_lifecycle["credential_availability"] == "recoverable":
-        reason_code, reason = "access_token_refresh_required", "AT 已失效，将使用 RT 自动刷新"
+        reason_code, reason = "access_token_refresh_required", "AT hết hạn, đang tự làm mới qua RT"
     else:
-        reason_code, reason = "", "账号已启用，当前凭据可调用"
+        reason_code, reason = "", "Tài khoản đang hoạt động bình thường"
 
     return (
         category,
@@ -253,10 +258,10 @@ def account_row(
     quota_remaining = max(0, int(account.get("quota") or 0))
     if unlimited_quota:
         quota_state = "unlimited"
-        quota_label = "无限"
+        quota_label = "Vô hạn"
     elif quota_unknown:
         quota_state = "unknown"
-        quota_label = "未知"
+        quota_label = "Chưa rõ"
     elif quota_remaining <= 0:
         quota_state = "exhausted"
         quota_label = "0"
@@ -297,7 +302,7 @@ def account_row(
         "status_raw_error": raw_error,
         "enabled": enabled,
         "enabled_action": enabled_action,
-        "enabled_action_label": "停用账号" if enabled_action == "disable" else "恢复启用",
+        "enabled_action_label": "Tạm dừng" if enabled_action == "disable" else "Kích hoạt",
         "available": bool(available),
         **credential_lifecycle,
         "quota_remaining": quota_remaining,

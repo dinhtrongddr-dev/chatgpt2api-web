@@ -132,6 +132,9 @@ def create_app() -> FastAPI:
         asset = resolve_web_asset(full_path)
         if asset is None:
             raise HTTPException(status_code=404, detail="Not Found")
-        return FileResponse(asset)
+        return FileResponse(
+            asset,
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
+        )
 
     return app
