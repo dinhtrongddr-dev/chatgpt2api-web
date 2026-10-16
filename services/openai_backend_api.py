@@ -684,13 +684,15 @@ class OpenAIBackendAPI:
         """把标准 chat messages 转成 web conversation 所需的 messages。"""
         conversation_messages = []
         for item in messages:
-            role = item.get("role", "user")
+            raw_role = str(item.get("role") or "user").strip().lower()
+            role = "user" if raw_role in {"system", "developer"} else raw_role
             content = item.get("content", "")
             if isinstance(content, str):
+                parts = [f"[System Instructions]\n{content}"] if raw_role in {"system", "developer"} else [content]
                 conversation_messages.append({
                     "id": new_uuid(),
                     "author": {"role": role},
-                    "content": {"content_type": "text", "parts": [content]},
+                    "content": {"content_type": "text", "parts": parts},
                 })
                 continue
             if not isinstance(content, list):
@@ -910,15 +912,24 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _web_text_message(message: Dict[str, Any]) -> Dict[str, Any]:
-        role = str(message.get("role") or "user")
+        raw_role = str(message.get("role") or "user").strip().lower()
         content = message.get("content")
         if not isinstance(content, str):
             raise ValueError("Web text transport currently accepts text content only")
+        if raw_role in {"system", "developer"}:
+            role = "user"
+            parts = [f"[System Instructions]\n{content}"]
+        elif raw_role == "assistant":
+            role = "assistant"
+            parts = [content]
+        else:
+            role = "user"
+            parts = [content]
         return {
             "id": new_uuid(),
             "author": {"role": role},
             "create_time": time.time(),
-            "content": {"content_type": "text", "parts": [content]},
+            "content": {"content_type": "text", "parts": parts},
             "metadata": {
                 "developer_mode_connector_ids": [],
                 "selected_github_repos": [],
