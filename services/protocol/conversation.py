@@ -1058,6 +1058,7 @@ def conversation_events(
     thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
+    image_model = bool(images)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
     final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
