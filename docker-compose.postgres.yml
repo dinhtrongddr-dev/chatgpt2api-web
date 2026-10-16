@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: chatgpt2api-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: chatgpt2api
+      POSTGRES_USER: chatgpt2api
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatgpt2api_secret}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatgpt2api -d chatgpt2api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chatgpt2api:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://chatgpt2api:${POSTGRES_PASSWORD:-chatgpt2api_secret}@postgres:5432/chatgpt2api
+
+volumes:
+  postgres-data:

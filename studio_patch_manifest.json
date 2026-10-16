@@ -1,0 +1,38 @@
+{
+  "id": "studio-model-limits-v2",
+  "baseCommit": "dc105e51bd486bd75c8ef4f74be4bc4724bdfc33",
+  "files": [
+    {
+      "path": "studio_upstream_errors.py",
+      "baseSha256": null,
+      "previousSha256": [
+        "8301d5c86e3d7d5b8028a8f28a2923f2450189bef1804aa9b8229e3d39428f91"
+      ],
+      "sha256": "a3871fa789ae31e893d4f61c31902ab4bd420a4eef477244618ae25b9de5f20b"
+    },
+    {
+      "path": "services/protocol/conversation.py",
+      "baseSha256": "7717aa5e61c296bb9bfc3121d23026b1571ab7f1fff11ea29aab8b929e14db42",
+      "previousSha256": [
+        "906c70479024146e15d723e1cbfe1f4f15140c5ac963d2d86235f68e11725ca5"
+      ],
+      "sha256": "c981c75e3dcd60c5b3c82826b5af046ef04ad575f466d853bafee088914de0e5"
+    },
+    {
+      "path": "services/openai_backend_api.py",
+      "baseSha256": "5c0652e5601ed4da9bdabbe3d600f1e5eb267aa9714bff34e4e4d8bbf3bcf79a",
+      "previousSha256": [
+        "3a12ea7aad9eb86d69fe6dca68a33fc37fb92f082621a58ac25170a6013bc28f"
+      ],
+      "sha256": "e5f8978fd28a5b1fe01d84564754eebc8c25bdc982e88b72c8e3de11278e3b07"
+    },
+    {
+      "path": "api/ai.py",
+      "baseSha256": "5159fe95011fa62b72c58fdeffb0b7ec5eea10095ac972b8990708df8712bd1b",
+      "previousSha256": [
+        "3870f017586f69533604b62b37187880e9a5a7fe8128e6e36025369d36b1e56d"
+      ],
+      "sha256": "b8866db441f879d7c497588f4f2b756fc5692d44c6c9ebbfb85b3a750dcb7bf4"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+curl-cffi>=0.15.0
+fastapi>=0.115.0
+pillow>=10.0.0
+pybase64>=1.4.0
+python-multipart>=0.0.20
+tiktoken>=0.8.0
+uvicorn>=0.30.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+httpx>=0.28.0

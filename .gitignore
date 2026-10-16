@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+*.enc
+auth-key.enc
+config.json
+config.local*.json
+
+# Database & Runtime Data
+data/
+*.db
+*.sqlite
+*.sqlite3
+postgres-data/
+
+# Logs & Debug
+logs/
+*.log
+*.jsonl
+.codex/
+.codegraph*/
+.playwright*/
+output/
+runtime/
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

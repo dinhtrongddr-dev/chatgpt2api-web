@@ -1,0 +1,17 @@
+[Unit]
+Description=ChatGPT2API Service (Web Edition)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/chatgpt2api
+EnvironmentFile=-/opt/chatgpt2api/.env
+ExecStart=/opt/chatgpt2api/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
