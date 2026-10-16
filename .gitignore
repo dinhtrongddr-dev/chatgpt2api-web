@@ -46,7 +46,8 @@ data/
 postgres-data/
 
 # Logs & Debug
-logs/
+/logs/
+!web_dist/logs/
 *.log
 *.jsonl
 .codex/
