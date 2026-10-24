@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import count_message_tokens, count_text_tokens, normalize_messages, text_backend
+from services.protocol.conversation import count_message_tokens, count_text_tokens, normalize_messages, sanitize_output_text, text_backend
 from services.protocol.openai_v1_chat_complete import collect_chat_content, stream_text_chat_completion
 
 XML_TOOL_RULE = """Tool output adapter: when calling tools, output ONLY this XML and no prose/markdown:
-<tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>"""
+<tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM1>value1</PARAM1><PARAM2>value2</PARAM2></parameters></tool_call></tool_calls>"""
 
 
 @dataclass
@@ -48,10 +48,10 @@ def build_tool_prompt(tools: object) -> str:
     return "Available tools:\n" + "\n".join(blocks) + """
 
 Tool use rules:
-- If the user asks to list/read/search files, inspect project state, run a command, or answer from local code, you MUST call a suitable tool first. Do not say you cannot access files.
+- If the user asks to list/read/search files, inspect project state, run a command, download media/music, or answer from local code, you MUST call a suitable tool first. Do not say you cannot access files or tools.
 - To call tools, output ONLY XML and no prose/markdown:
-<tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>
-- Put parameters under <parameters> using the exact schema names.
+<tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM1>value1</PARAM1><PARAM2>value2</PARAM2></parameters></tool_call></tool_calls>
+- Put all parameter key-value pairs inside <parameters>...</parameters> using the exact parameter names from the schema.
 """.strip()
 
 
@@ -108,10 +108,11 @@ def preprocess_payload(payload: dict[str, object], text_mapper: Callable[[str], 
 
 def message_request(body: dict[str, Any]) -> MessageRequest:
     payload = preprocess_payload(dict(body))
+    model = str(payload.get("model") or "auto").strip() or "auto"
     return MessageRequest(
-        backend=text_backend(),
+        backend=text_backend(model=model),
         messages=normalize_messages(payload.get("messages"), payload.get("system")),
-        model=str(payload.get("model") or "auto").strip() or "auto",
+        model=model,
         tools=payload.get("tools"),
     )
 
@@ -173,12 +174,14 @@ def content_blocks(text: str, tools: object = None) -> tuple[list[dict[str, obje
 
 
 def strip_tool_markup(text: str) -> str:
-    return re.sub(r"(?is)<tool_calls\b[^>]*>.*?</tool_calls>|<tool_call\b[^>]*>.*?</tool_call>|<function_call\b[^>]*>.*?</function_call>|<invoke\b[^>]*>.*?</invoke>", "", text or "").strip()
+    text = re.sub(r"(?is)<tool_calls\b[^>]*>.*?</tool_calls>|<tool_call\b[^>]*>.*?</tool_call>|<function_call\b[^>]*>.*?</function_call>|<invoke\b[^>]*>.*?</invoke>", "", text or "")
+    text = re.sub(r"(?is)</?escape\b[^>]*>", "", text)
+    return sanitize_output_text(text.strip(), is_streaming=False)
 
 
 def streamable_text(text: str) -> str:
     text = text or ""
-    match = re.search(r"(?is)<tool_calls\b|<tool_call\b|<function_call\b|<invoke\b", text)
+    match = re.search(r"(?is)<escape\b|<tool_calls\b|<tool_call\b|<function_call\b|<invoke\b", text)
     return text[:match.start()].rstrip() if match else text
 
 
@@ -188,15 +191,44 @@ def _with_log_metadata(payload: dict[str, object], account_email: str = "") -> d
     return payload
 
 
+def clean_param_val(val: str) -> str:
+    val = re.sub(r"(?is)<!\[CDATA\[(.*?)]]>", r"\1", val)
+    return html.unescape(val).strip()
+
+
+def robust_parse_params(block: str) -> dict[str, object]:
+    cleaned = block
+    for tag in ["tool_name", "name", "function", "parameters", "input", "arguments"]:
+        cleaned = re.sub(rf"(?is)</?{tag}\b[^>]*>", " ", cleaned)
+    pattern = r"(?is)<([a-zA-Z_][\w.-]*)\b[^>]*>(?:<!\[CDATA\[(.*?)]]>|(.*?))(?:</\1>|(?=<[a-zA-Z_]|$))"
+    result: dict[str, object] = {}
+    for m in re.finditer(pattern, cleaned):
+        key = m.group(1).strip()
+        val = m.group(2) if m.group(2) is not None else m.group(3)
+        val_str = clean_param_val(val or "")
+        if key and val_str and key not in ["escape", "tool_calls", "tool_call", "function_call", "invoke"]:
+            try:
+                result[key] = json.loads(val_str)
+            except Exception:
+                result[key] = val_str
+    return result
+
+
 def parse_tool_calls(text: str) -> list[tuple[str, dict[str, object]]]:
     text = re.sub(r"(?is)```.*?```", "", text or "").strip()
     blocks = re.findall(r"(?is)<tool_call\b[^>]*>(.*?)</tool_call>|<function_call\b[^>]*>(.*?)</function_call>|<invoke\b[^>]*>(.*?)</invoke>", text)
     result = []
     for block in (next((part for part in match if part), "") for match in blocks):
         name = xml_value(block, "tool_name") or xml_value(block, "name") or xml_value(block, "function")
-        params = xml_value(block, "parameters") or xml_value(block, "input") or xml_value(block, "arguments") or "{}"
+        params_str = xml_value(block, "parameters") or xml_value(block, "input") or xml_value(block, "arguments")
+        params = parse_tool_params(params_str) if params_str else {}
+        robust_params = robust_parse_params(block)
+        merged = {**robust_params, **params}
+        for k, v in robust_params.items():
+            if k not in merged or not merged[k]:
+                merged[k] = v
         if name:
-            result.append((name, parse_tool_params(params)))
+            result.append((name, merged))
     return result
 
 
@@ -220,6 +252,7 @@ def parse_tool_params(raw: str) -> dict[str, object]:
 
 def parse_tool_value(raw: str) -> object:
     value = xml_value(f"<x>{raw}</x>", "x")
+    value = clean_param_val(value)
     try:
         return json.loads(value)
     except Exception:

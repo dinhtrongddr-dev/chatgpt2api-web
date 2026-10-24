@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any, Iterable, Iterator
@@ -17,11 +18,13 @@ from services.protocol.conversation import (
     count_text_tokens,
     encode_images,
     normalize_messages,
+    sanitize_output_text,
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
 )
 from services.protocol.reasoning import thinking_effort_from_body
+from services.web_text_transport import WebTextStreamAudit, text_transport_request_id
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -105,6 +108,7 @@ def _with_log_metadata(
     image_urls: Iterable[str] | None = None,
     image_attempts: Iterable[dict[str, Any]] | None = None,
     image_data: list[dict[str, Any]] | None = None,
+    transport_audit: WebTextStreamAudit | None = None,
 ) -> dict[str, Any]:
     if account_email:
         payload["_account_email"] = account_email
@@ -118,6 +122,8 @@ def _with_log_metadata(
         payload["_image_attempts"] = attempts
     if image_data:
         payload["_image_metadata"] = image_output_metadata(image_data)
+    if isinstance(transport_audit, WebTextStreamAudit):
+        payload["_web_text_transport"] = transport_audit.fields()
     return payload
 
 
@@ -125,16 +131,107 @@ def _backend_account_email(backend: object) -> str:
     return str(getattr(backend, "account_email", "") or "").strip()
 
 
+def preprocess_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    processed = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user").strip().lower()
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+
+        if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+            xml_blocks = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                name = fn.get("name") or tc.get("name") or ""
+                args = fn.get("arguments") or tc.get("arguments") or "{}"
+                if isinstance(args, dict):
+                    args_str = json.dumps(args, ensure_ascii=False)
+                else:
+                    args_str = str(args)
+                xml_blocks.append(f"<tool_calls><tool_call><tool_name>{name}</tool_name><parameters>{args_str}</parameters></tool_call></tool_calls>")
+            text_content = str(content or "").strip()
+            combined = f"{text_content}\n" + "\n".join(xml_blocks) if text_content else "\n".join(xml_blocks)
+            processed.append({"role": "assistant", "content": combined})
+        elif role in ("tool", "function"):
+            tool_id = msg.get("tool_call_id") or msg.get("name") or "tool"
+            text_content = str(content or "")
+            processed.append({"role": "user", "content": f"[Tool Result for {tool_id}]:\n{text_content}"})
+        else:
+            processed.append(dict(msg))
+    return processed
+
+
 def stream_text_chat_completion(
     backend,
     messages: list[dict[str, Any]],
     model: str,
     thinking_effort: str = "",
+    tools: list[dict[str, Any]] | None = None,
+    call_id: str = "",
 ) -> Iterator[dict[str, Any]]:
+    from services.protocol.anthropic_v1_messages import parse_tool_calls, strip_tool_markup
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort, call_id=call_id)
+
+    if tools:
+        accumulated_text = ""
+        for delta_text in stream_text_deltas(backend, request):
+            accumulated_text += delta_text
+
+        calls = parse_tool_calls(accumulated_text)
+        if calls:
+            clean_text = strip_tool_markup(accumulated_text)
+            if clean_text:
+                yield _with_log_metadata(
+                    completion_chunk(model, {"role": "assistant", "content": clean_text}, None, completion_id, created),
+                    _backend_account_email(backend),
+                )
+            tool_call_deltas = []
+            for idx, (name, args) in enumerate(calls):
+                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                tc_dict = {
+                    "index": idx,
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": args_str,
+                    }
+                }
+                tool_call_deltas.append(tc_dict)
+
+            delta: dict[str, Any] = {"tool_calls": tool_call_deltas}
+            if not clean_text:
+                delta["role"] = "assistant"
+                delta["content"] = None
+            yield _with_log_metadata(
+                completion_chunk(model, delta, None, completion_id, created),
+                _backend_account_email(backend),
+            )
+            yield _with_log_metadata(
+                completion_chunk(model, {}, "tool_calls", completion_id, created),
+                _backend_account_email(backend),
+                transport_audit=getattr(backend, "web_text_audit", None),
+            )
+            return
+        else:
+            yield _with_log_metadata(
+                completion_chunk(model, {"role": "assistant", "content": accumulated_text}, None, completion_id, created),
+                _backend_account_email(backend),
+            )
+            yield _with_log_metadata(
+                completion_chunk(model, {}, "stop", completion_id, created),
+                _backend_account_email(backend),
+                transport_audit=getattr(backend, "web_text_audit", None),
+            )
+            return
+
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     for delta_text in stream_text_deltas(backend, request):
         if not sent_role:
             sent_role = True
@@ -152,7 +249,7 @@ def stream_text_chat_completion(
             completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created),
             _backend_account_email(backend),
         )
-    yield _with_log_metadata(completion_chunk(model, {}, "stop", completion_id, created), _backend_account_email(backend))
+    yield _with_log_metadata(completion_chunk(model, {}, "stop", completion_id, created), _backend_account_email(backend), transport_audit=getattr(backend, "web_text_audit", None))
 
 
 def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:
@@ -190,12 +287,29 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
     return model, prompt, parse_image_count(body.get("n")), images, base_url
 
 
-def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]] | None]:
+    from services.protocol.anthropic_v1_messages import build_tool_prompt, merge_system
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = normalize_text_messages(normalize_messages(chat_messages_from_body(body)))
-    if has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
-        messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
-    return model, messages
+    raw_messages = chat_messages_from_body(body)
+    preprocessed = preprocess_openai_messages(raw_messages)
+
+    tools = body.get("tools")
+    active_tools = tools if isinstance(tools, list) and tools else None
+
+    system_text = ""
+    filtered_messages = []
+    for msg in preprocessed:
+        if str(msg.get("role") or "").lower() == "system":
+            content = str(msg.get("content") or "").strip()
+            system_text = f"{system_text}\n\n{content}".strip() if system_text else content
+        else:
+            filtered_messages.append(msg)
+
+    if active_tools:
+        system_text = merge_system(system_text, build_tool_prompt(active_tools))
+
+    messages = normalize_text_messages(normalize_messages(filtered_messages, system_text))
+    return model, messages, active_tools
 
 
 def chat_completion_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -333,37 +447,97 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
-def text_completion_response(model: str, messages: list[dict[str, Any]], thinking_effort: str) -> dict[str, Any]:
-    backend = text_backend()
+def text_completion_response(
+    model: str,
+    messages: list[dict[str, Any]],
+    thinking_effort: str,
+    tools: list[dict[str, Any]] | None = None,
+    call_id: str = "",
+) -> dict[str, Any]:
+    from services.protocol.anthropic_v1_messages import parse_tool_calls, strip_tool_markup
+    backend = text_backend(model=model)
+    raw_text = collect_text(backend, ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort, call_id=call_id))
+
+    calls = parse_tool_calls(raw_text) if tools else []
+    if calls:
+        clean_text = strip_tool_markup(raw_text)
+        openai_tool_calls = [
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args),
+                }
+            }
+            for name, args in calls
+        ]
+        prompt_text_tokens = count_message_text_tokens(messages, model) if messages else 0
+        prompt_image_tokens = count_message_image_tokens(messages, model) if messages else 0
+        prompt_tokens = prompt_text_tokens + prompt_image_tokens
+        completion_tokens = count_text_tokens(raw_text, model)
+
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": clean_text or None,
+                    "tool_calls": openai_tool_calls,
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "prompt_tokens_details": {
+                    "text_tokens": prompt_text_tokens,
+                    "image_tokens": prompt_image_tokens,
+                    "cached_tokens": 0,
+                },
+                "completion_tokens_details": {
+                    "text_tokens": completion_tokens,
+                    "image_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+            },
+        }
+        return _with_log_metadata(response, _backend_account_email(backend), transport_audit=getattr(backend, "web_text_audit", None))
+
     response = completion_response(
         model,
-        collect_text(backend, ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
+        sanitize_output_text(raw_text, is_streaming=False),
         messages=messages,
     )
-    return _with_log_metadata(response, _backend_account_email(backend))
+    return _with_log_metadata(response, _backend_account_email(backend), transport_audit=getattr(backend, "web_text_audit", None))
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
             return image_chat_events(body)
-        model, messages = text_chat_parts(body)
+        model, messages, tools = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
         thinking_effort = thinking_effort_from_body(body)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
+            lambda: stream_text_chat_completion(text_backend(model=model), messages, model, thinking_effort, tools=tools, call_id=text_transport_request_id(body)),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
-    model, messages = text_chat_parts(body)
+    model, messages, tools = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
     thinking_effort = thinking_effort_from_body(body)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
-        lambda: text_completion_response(model, messages, thinking_effort),
+        lambda: text_completion_response(model, messages, thinking_effort, tools=tools, call_id=text_transport_request_id(body)),
     )

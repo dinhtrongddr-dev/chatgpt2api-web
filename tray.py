@@ -9,12 +9,23 @@ ChatGPT2API (Web Edition) - System Tray Companion & Server Manager
 import os
 import sys
 import time
+
+if sys.platform == "win32":
+    os.environ["PYTHONUTF8"] = "1"
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 import json
 import socket
 import threading
 import subprocess
 import webbrowser
 from pathlib import Path
+import ctypes
+from ctypes import wintypes
 
 # Tkinter for Info GUI
 import tkinter as tk
@@ -40,6 +51,94 @@ CONFIG_FILE = APP_DIR / "config.json"
 FAVICON_FILE = APP_DIR / "web_dist" / "favicon.ico"
 LOG_FILE = APP_DIR / "service.log"
 LOCK_FILE = DATA_DIR / "tray.lock"
+
+# Named Windows Mutex to guarantee single instance across reboots/crashes
+_tray_mutex = None
+
+
+def acquire_single_instance_mutex():
+    global _tray_mutex
+    MUTEX_NAME = "Local\\ChatGPT2API_Web_SingleInstance_Mutex"
+    ERROR_ALREADY_EXISTS = 183
+    try:
+        kernel32 = ctypes.windll.kernel32
+        _tray_mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        last_error = kernel32.GetLastError()
+        if last_error == ERROR_ALREADY_EXISTS:
+            return False
+        return bool(_tray_mutex)
+    except Exception:
+        return acquire_pid_lock()
+
+
+def release_single_instance_mutex():
+    global _tray_mutex
+    if _tray_mutex:
+        try:
+            ctypes.windll.kernel32.CloseHandle(_tray_mutex)
+        except Exception:
+            pass
+        _tray_mutex = None
+
+
+def is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        exit_code = wintypes.DWORD()
+        res = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        kernel32.CloseHandle(handle)
+        return bool(res and exit_code.value == 259)
+    except Exception:
+        return False
+
+
+def acquire_pid_lock() -> bool:
+    if LOCK_FILE.exists():
+        try:
+            content = LOCK_FILE.read_text(encoding="utf-8").strip()
+            if content.isdigit():
+                existing_pid = int(content)
+                if is_pid_alive(existing_pid):
+                    return False
+        except Exception:
+            pass
+        try:
+            LOCK_FILE.unlink()
+        except Exception:
+            pass
+    return True
+
+
+def write_pid_file():
+    try:
+        LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def cleanup_pid_file():
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+
+
+TRAY_LOG_FILE = APP_DIR / "tray.log"
+
+
+def log_tray(msg: str):
+    try:
+        with open(TRAY_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
 
 # Global state
 server_process = None
@@ -138,7 +237,19 @@ def start_backend():
     host, port, auth_key = load_config()
 
     if is_port_listening(port, host):
+        log_tray(f"Port {port} is already listening.")
         server_running = True
+        return
+
+    # If already spawned and still running, wait for it to bind port
+    if server_process and server_process.poll() is None:
+        log_tray(f"Backend PID={server_process.pid} is already running, waiting for port {port}...")
+        for _ in range(30):
+            if is_port_listening(port, host):
+                server_running = True
+                log_tray(f"Port {port} is now LISTENING!")
+                return
+            time.sleep(0.5)
         return
 
     cmd = [
@@ -154,6 +265,7 @@ def start_backend():
         "info",
     ]
 
+    log_tray(f"Launching uvicorn backend on port {port}...")
     env = os.environ.copy()
     env["CHATGPT2API_AUTH_KEY"] = auth_key
     env["CHATGPT2API_PORT"] = str(port)
@@ -174,13 +286,37 @@ def start_backend():
         stderr=subprocess.STDOUT,
         creationflags=creation_flags,
     )
+    try:
+        log_fp.close()
+    except Exception:
+        pass
 
-    # Wait up to 5s for port to listen
-    for _ in range(25):
+    log_tray(f"Backend process spawned, PID={server_process.pid}. Waiting for port {port}...")
+    # Wait up to 20s for port to listen (initial module loading takes ~10-15s)
+    for _ in range(40):
         if is_port_listening(port, host):
             server_running = True
+            log_tray(f"Port {port} is now LISTENING!")
             break
-        time.sleep(0.2)
+        if server_process.poll() is not None:
+            log_tray(f"Error: Backend process PID={server_process.pid} exited prematurely with code {server_process.returncode}")
+            break
+        time.sleep(0.5)
+    else:
+        log_tray(f"Warning: Port {port} did not start listening within 20s.")
+
+
+def kill_process_on_port(port: int):
+    try:
+        res = subprocess.check_output(f'netstat -ano -p tcp | findstr ":{port} "', shell=True).decode()
+        for line in res.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 5 and "LISTENING" in parts:
+                pid = int(parts[-1])
+                if pid > 0 and pid != os.getpid():
+                    subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def stop_backend():
@@ -194,6 +330,8 @@ def stop_backend():
                 server_process.kill()
             except Exception:
                 pass
+    _, port, _ = load_config()
+    kill_process_on_port(port)
     server_process = None
     server_running = False
 
@@ -305,12 +443,35 @@ def render_info_gui():
             with urllib.request.urlopen(req, timeout=3) as resp:
                 if resp.status == 200:
                     status_lbl.config(text=f"🟢 Dịch vụ hoạt động tốt trên cổng {port}!", fg="#15803d")
+                    action_btn.config(text="Khởi động lại", bg="#64748b", command=on_restart_server)
                     return
         except Exception as e:
-            status_lbl.config(text=f"🔴 Chưa kết nối được: {e}", fg="#b91c1c")
+            err_str = str(e)
+            if "10061" in err_str or "actively refused" in err_str:
+                status_lbl.config(text=f"🔴 Server chưa chạy trên cổng {port}", fg="#b91c1c")
+            elif "timed out" in err_str:
+                status_lbl.config(text=f"🟡 Đang phản hồi chậm trên cổng {port}", fg="#b45309")
+            else:
+                status_lbl.config(text=f"🔴 Chưa kết nối được cổng {port}", fg="#b91c1c")
+            action_btn.config(text="▶ Bật Server", bg="#10b981", command=on_start_server)
 
-    ping_btn = tk.Button(test_frame, text="Kiểm tra kết nối", font=("Segoe UI", 8, "bold"), bg="#3b82f6", fg="white", relief="flat", padx=10, cursor="hand2", command=ping_test)
-    ping_btn.pack(side="right")
+    def on_start_server():
+        status_lbl.config(text="Đang khởi động server...", fg="#2563eb")
+        root.update()
+        start_backend()
+        root.after(1000, ping_test)
+
+    def on_restart_server():
+        status_lbl.config(text="Đang khởi động lại server...", fg="#2563eb")
+        root.update()
+        restart_backend()
+        root.after(1000, ping_test)
+
+    ping_btn = tk.Button(test_frame, text="Kiểm tra lại", font=("Segoe UI", 8, "bold"), bg="#3b82f6", fg="white", relief="flat", padx=10, cursor="hand2", command=ping_test)
+    ping_btn.pack(side="right", padx=(4, 0))
+
+    action_btn = tk.Button(test_frame, text="▶ Bật Server", font=("Segoe UI", 8, "bold"), bg="#10b981", fg="white", relief="flat", padx=10, cursor="hand2", command=on_start_server)
+    action_btn.pack(side="right")
 
     btn_frame = tk.Frame(root, bg=bg_color, pady=12)
     btn_frame.pack(fill="x", padx=20)
@@ -359,14 +520,19 @@ def monitor_loop():
     global server_running
     host, port, _ = load_config()
     while not should_exit:
-        alive = is_port_listening(port, host)
-        server_running = alive
-        if not alive and not should_exit:
-            start_backend()
-        if tray_icon:
-            st = "🟢 Đang chạy" if server_running else "🔴 Đã dừng"
-            tray_icon.title = f"ChatGPT2API (Web Edition) - {st} (Port {port})"
-        time.sleep(4)
+        try:
+            alive = is_port_listening(port, host)
+            server_running = alive
+            if not alive and not should_exit:
+                if server_process is None or server_process.poll() is not None:
+                    log_tray(f"Port {port} not listening and backend not alive, starting backend...")
+                    start_backend()
+            if tray_icon:
+                st = "🟢 Đang chạy" if server_running else "🔴 Đã dừng"
+                tray_icon.title = f"ChatGPT2API (Web Edition) - {st} (Port {port})"
+        except Exception as e:
+            log_tray(f"Error in monitor_loop: {e}")
+        time.sleep(5)
 
 
 def build_menu():
@@ -393,40 +559,45 @@ def main():
         render_info_gui()
         return
 
-    # Single instance lock
-    try:
-        lock_fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-    except OSError:
-        # Already running! Open info GUI instead
+    # Single instance lock via Named Mutex
+    if not acquire_single_instance_mutex():
+        log_tray("Another instance already running. Opening Info GUI.")
         render_info_gui()
         return
 
-    # Start backend server
-    start_backend()
-
-    # Start background monitor thread
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
-
-    # Start Tray Icon
-    host, port, _ = load_config()
-    tray_icon = pystray.Icon(
-        name="ChatGPT2API",
-        icon=get_icon_image(),
-        title=f"ChatGPT2API (Web Edition) - Đang chạy (Port {port})",
-        menu=build_menu(),
-    )
-
     try:
+        log_tray(f"Acquired single instance mutex. PID={os.getpid()}")
+        write_pid_file()
+
+        # Start backend server
+        start_backend()
+
+        # Start background monitor thread
+        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        monitor_thread.start()
+
+        # Start Tray Icon
+        host, port, _ = load_config()
+        log_tray(f"Initializing pystray Icon on port {port}...")
+        tray_icon = pystray.Icon(
+            name="ChatGPT2API",
+            icon=get_icon_image(),
+            title=f"ChatGPT2API (Web Edition) - Đang chạy (Port {port})",
+            menu=build_menu(),
+        )
+
+        log_tray("Starting tray_icon.run()...")
         tray_icon.run()
+        log_tray("tray_icon.run() completed.")
+    except Exception as e:
+        import traceback
+        log_tray(f"Exception in main: {e}\n{traceback.format_exc()}")
     finally:
-        try:
-            os.close(lock_fd)
-            if LOCK_FILE.exists():
-                LOCK_FILE.unlink()
-        except Exception:
-            pass
+        log_tray("Cleaning up tray process...")
+        cleanup_pid_file()
+        release_single_instance_mutex()
         stop_backend()
+        log_tray("Cleanup complete. Exiting.")
 
 
 if __name__ == "__main__":

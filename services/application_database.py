@@ -4,6 +4,10 @@ import os
 import threading
 from pathlib import Path
 
+from services.web_text_transport import isolated_http1_enabled
+
+isolated_http1_enabled(Path(__file__).resolve().parents[1])
+
 from sqlalchemy import create_engine, event, make_url
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base

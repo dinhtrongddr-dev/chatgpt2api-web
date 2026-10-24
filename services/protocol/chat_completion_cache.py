@@ -30,6 +30,7 @@ CACHEABLE_TEXT_KEYS = {
     "user",
 }
 INTERNAL_RESPONSE_KEYS = {
+    "_web_text_transport",
     "_account_email",
     "_conversation_id",
     "_call_id",

@@ -8,6 +8,12 @@ from time import monotonic
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from services.web_text_transport import isolated_http1_enabled
+
+# Fail before importing repository singletons if the experiment points at the
+# production checkout or a shared database. Default mode is unchanged.
+isolated_http1_enabled(Path(__file__).resolve().parents[1])
+
 from contracts.settings_specification import (
     normalize_float_setting,
     normalize_integer_setting,
@@ -601,7 +607,7 @@ class ConfigStore:
     @property
     def image_remove_conversation_after_result(self) -> bool:
         self.reload_if_changed()
-        return _normalize_bool(self.data.get("image_remove_conversation_after_result"), False)
+        return _normalize_bool(self.data.get("image_remove_conversation_after_result"), True)
 
     @property
     def image_settle_enabled(self) -> bool:

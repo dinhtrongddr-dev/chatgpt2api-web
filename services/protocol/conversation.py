@@ -384,6 +384,70 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def scan_image_codes(image_bytes: bytes) -> list[str]:
+    """Scan image bytes for QR codes and barcodes using OpenCV.
+
+    Returns a list of decoded strings/URLs. Takes <50ms. Never throws exceptions.
+    """
+    if not image_bytes or len(image_bytes) < 100:
+        return []
+    try:
+        import cv2
+        import numpy as np
+
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return []
+
+        results: list[str] = []
+
+        # 1. Full image QR detection
+        detector = cv2.QRCodeDetector()
+        val, _, _ = detector.detectAndDecode(img)
+        if val and val.strip():
+            results.append(val.strip())
+
+        # 2. Multi QR detection if single didn't find or to find all
+        if not results:
+            retval, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
+            if retval and decoded_info:
+                for item in decoded_info:
+                    if item and item.strip() and item.strip() not in results:
+                        results.append(item.strip())
+
+        # 3. Corner crops (especially bottom-right corner where e-commerce QR codes are placed)
+        if not results:
+            h, w = img.shape[:2]
+            # Bottom-right 45%
+            br_crop = img[int(h * 0.55):, int(w * 0.55):]
+            v_br, _, _ = detector.detectAndDecode(br_crop)
+            if v_br and v_br.strip() and v_br.strip() not in results:
+                results.append(v_br.strip())
+
+            # Bottom-left 45%
+            if not results:
+                bl_crop = img[int(h * 0.55):, :int(w * 0.45)]
+                v_bl, _, _ = detector.detectAndDecode(bl_crop)
+                if v_bl and v_bl.strip() and v_bl.strip() not in results:
+                    results.append(v_bl.strip())
+
+        # 4. Barcode detection
+        try:
+            bd = cv2.barcode.BarcodeDetector()
+            ret, barcode_info, _, _ = bd.detectAndDecode(img)
+            if ret and barcode_info:
+                for b in barcode_info:
+                    if b and b.strip() and b.strip() not in results:
+                        results.append(b.strip())
+        except Exception:
+            pass
+
+        return results
+    except Exception:
+        return []
+
+
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
     normalized = []
     if config.global_system_prompt:
@@ -409,6 +473,21 @@ def normalize_messages(messages: object, system: Any = None) -> list[dict[str, A
                         if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
                             images.append((bytes(data), str(part.get("mime") or "image/png")))
             if images:
+                detected_codes: list[str] = []
+                for img_data, _ in images:
+                    codes = scan_image_codes(img_data)
+                    for c in codes:
+                        if c not in detected_codes:
+                            detected_codes.append(c)
+                if detected_codes:
+                    codes_str = "\n".join(f"- {c}" for c in detected_codes)
+                    scan_hint = (
+                        f"\n\n[Hệ thống hỗ trợ thị giác & Quét mã tự động từ ảnh:\n{codes_str}\n"
+                        f"Ghi chú: Ảnh người dùng gửi có chứa mã QR/Barcode trên. Hãy ưu tiên sử dụng đường link/mã này "
+                        f"để trả lời hoặc cung cấp trực tiếp đường link [Xem sản phẩm](URL) cho người dùng.]"
+                    )
+                    text = f"{text}{scan_hint}" if text else scan_hint
+
                 parts: list[Any] = []
                 if text:
                     parts.append({"type": "text", "text": text})
@@ -614,14 +693,17 @@ class ImageOutput:
 
 def assistant_message_text(message: dict[str, Any]) -> str:
     content = message.get("content") or {}
+    content_type = str(content.get("content_type") or "").strip().lower()
+    recipient = str(message.get("recipient") or "").strip().lower()
+    if content_type in {"code", "thoughts", "reasoning_recap"} or recipient not in {"", "all"}:
+        return ""
     parts = content.get("parts") or []
     if isinstance(parts, list) and parts:
         text = "".join(part for part in parts if isinstance(part, str))
         if text:
             return text
-    # Fallback: content_type "code" stores text in the "text" field instead of "parts"
     text_field = str(content.get("text") or "")
-    if text_field:
+    if text_field and content_type not in {"code", "thoughts", "reasoning_recap"}:
         return text_field
     return ""
 
@@ -674,7 +756,84 @@ def strip_history(text: str, history_text: str = "") -> str:
     return text
 
 
-def sanitize_output_text(text: str) -> str:
+def sanitize_ui_tags(text: str, is_streaming: bool = False) -> str:
+    """Sanitize ChatGPT Web pseudo-UI tags into clean Markdown.
+
+    ChatGPT Web models output JSX/XML widgets (<box>, <row>, <AsyncImage>,
+    <title>, <text>, etc.) for shopping, weather, and search cards.
+    Converts titles to bold, text to plain lines, images to markdown (if URL present),
+    and strips container/layout tags while preserving full text flow.
+    """
+    text = str(text or "")
+    if not text:
+        return ""
+
+    if is_streaming:
+        # Buffer incomplete content tags waiting for their closing tag
+        m_content = re.search(
+            r"(?is)<(title|subtitle|text|badge|price|button|AsyncImage|Image)\b[^>]*>(?:(?!</\1>|/>).)*$",
+            text,
+        )
+        if m_content:
+            text = text[:m_content.start()]
+
+        # Buffer incomplete tag waiting for closing '>'
+        m_tag = re.search(r"(?:<$|<[a-zA-Z/!][^>]*$)", text)
+        if m_tag:
+            text = text[:m_tag.start()]
+
+    # Convert AsyncImage / Image tags
+    def replace_image(m: re.Match[str]) -> str:
+        content = m.group(0)
+        url_m = re.search(r'''(?:src|url)=["'](https?://[^\s"'>]+)["']''', content, re.I)
+        if url_m:
+            alt_m = re.search(r'''(?:alt|query)=["']([^"']+)["']''', content, re.I)
+            alt = alt_m.group(1) if alt_m else "hình ảnh"
+            return f"\n![{alt}]({url_m.group(1)})\n"
+        return ""
+
+    text = re.sub(r"(?is)<AsyncImage\b[^>]*(?:/>|>.*?</AsyncImage>)", replace_image, text)
+    text = re.sub(r"(?is)<Image\b[^>]*(?:/>|>.*?</Image>)", replace_image, text)
+
+    # Convert content tags
+    text = re.sub(r"(?is)<title\b[^>]*>(.*?)</title>", lambda m: f"**{m.group(1).strip()}**\n" if m.group(1).strip() else "", text)
+    text = re.sub(r"(?is)<subtitle\b[^>]*>(.*?)</subtitle>", lambda m: f"*{m.group(1).strip()}*\n" if m.group(1).strip() else "", text)
+    text = re.sub(r"(?is)<text\b[^>]*>(.*?)</text>", lambda m: f"{m.group(1).strip()}\n" if m.group(1).strip() else "", text)
+    text = re.sub(r"(?is)<badge\b[^>]*>(.*?)</badge>", lambda m: f" [{m.group(1).strip()}] " if m.group(1).strip() else "", text)
+    text = re.sub(r"(?is)<price\b[^>]*>(.*?)</price>", lambda m: f" **{m.group(1).strip()}** " if m.group(1).strip() else "", text)
+
+    def replace_button(m: re.Match[str]) -> str:
+        tag_open = m.group(1)
+        btn_text = m.group(2).strip()
+        href_m = re.search(r'''(?:href|url)=["'](https?://[^\s"'>]+)["']''', tag_open, re.I)
+        if href_m and btn_text:
+            return f"[{btn_text}]({href_m.group(1)})"
+        return btn_text
+
+    text = re.sub(r"(?is)<button\b([^>]*)>(.*?)</button>", replace_button, text)
+
+    # Dividers and spacers
+    text = re.sub(r"(?is)</?(?:divider|spacer)\b[^>]*\/?>", "\n", text)
+
+    # Containers (box, row, col, column, card, grid, callout, container, stack, group, section, item, list)
+    container_tags = "box|row|col|column|card|grid|callout|container|stack|group|section|item|list"
+    text = re.sub(rf"(?is)</?(?:{container_tags})\b[^>]*\/?>", "", text)
+
+    # Generic custom React JSX components (e.g. <ProductCard ...>, </ProductCard>)
+    text = re.sub(r"(?is)</?[A-Z][a-zA-Z0-9]*(?:\s+[^>]*)?\/?>", "", text)
+
+    # Clean empty lines with whitespace and excess newlines
+    text = re.sub(r"[ \t]+(?=\n|$)", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if not is_streaming:
+        lines = [line.strip() for line in text.splitlines()]
+        text = "\n".join(lines)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+    return text
+
+
+def sanitize_output_text(text: str, is_streaming: bool = False) -> str:
     text = str(text or "")
 
     def is_internal_annotation_part(part: str) -> bool:
@@ -716,7 +875,7 @@ def sanitize_output_text(text: str) -> str:
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)
-    return text
+    return sanitize_ui_tags(text, is_streaming=is_streaming)
 
 
 def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
@@ -750,7 +909,7 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
 
 
 def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
-    if event.get("p") in {"/message/content/parts/0", "/message/content/text"}:
+    if event.get("p") == "/message/content/parts/0":
         return apply_patch_op(event, current_text, history_text)
 
     operations = event.get("v")
@@ -1013,6 +1172,11 @@ def iter_conversation_payloads(
         if not payload:
             continue
         if payload == "[DONE]":
+            final_text = sanitize_output_text(state.raw_text, is_streaming=False)
+            if final_text != state.text and final_text.startswith(state.text):
+                delta = final_text[len(state.text):]
+                state.text = final_text
+                yield conversation_base_event("conversation.delta", state, delta=delta)
             yield conversation_base_event("conversation.done", state, done=True)
             break
         try:
@@ -1024,6 +1188,9 @@ def iter_conversation_payloads(
         if not isinstance(event, dict):
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
+        if event.get("error_code") == "usage_limit" or (event.get("error") and not event.get("message") and not event.get("p")):
+            err_msg = str(event.get("error") or "usage_limit")
+            raise UpstreamHTTPError(429, {"message": f"PROVIDER_USAGE_LIMIT: {err_msg}", "code": "usage_limit", "error_code": "usage_limit"})
         next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         update_conversation_state(
             state,
@@ -1037,7 +1204,7 @@ def iter_conversation_payloads(
             state.raw_text = ""
             state.text = ""
             continue
-        next_text = sanitize_output_text(next_raw_text)
+        next_text = sanitize_output_text(next_raw_text, is_streaming=True)
         state.raw_text = next_raw_text
         if next_text != state.text:
             delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
@@ -1058,7 +1225,7 @@ def conversation_events(
     thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
-    image_model = bool(images)
+    image_model = bool(images) or is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
     final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
@@ -1091,8 +1258,12 @@ def _remember_text_account(backend: OpenAIBackendAPI, access_token: str) -> str:
     return email
 
 
-def text_backend() -> OpenAIBackendAPI:
-    access_token = account_service.get_text_access_token()
+def text_backend(model: str = "") -> OpenAIBackendAPI:
+    access_token = account_service.get_text_access_token(model=model)
+    if not access_token and model:
+        access_token = account_service.get_text_access_token()
+    if not access_token:
+        raise RuntimeError("no available text account")
     backend = OpenAIBackendAPI(access_token=access_token)
     _remember_text_account(backend, access_token)
     return backend
@@ -1113,6 +1284,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         try:
             _remember_text_account(backend, token)
             active_backend = OpenAIBackendAPI(access_token=token)
+            if request.call_id:
+                active_backend.transport_request_id = request.call_id
             _remember_text_account(active_backend, token)
             for event in conversation_events(
                 active_backend,
@@ -1128,12 +1301,21 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     continue
                 delta = str(event.get("delta") or "")
                 if delta:
+                    audit = getattr(active_backend, "web_text_audit", None)
+                    if audit is not None:
+                        audit.content_frames = (audit.content_frames or 0) + 1
                     emitted = True
                     yield delta
             account_service.mark_text_used(token)
             return
         except Exception as exc:
             auth_failure = bool(token and _is_account_auth_failure(exc))
+            status_code = getattr(exc, "status_code", None)
+            is_upstream_err = (
+                isinstance(exc, UpstreamHTTPError)
+                and status_code in (401, 403, 429)
+            )
+            should_retry = (auth_failure or is_upstream_err) and not emitted and not getattr(active_backend, "web_text_http1", False)
             if auth_failure:
                 try:
                     account_service.schedule_auth_verification(
@@ -1153,16 +1335,20 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                         "source": "text_stream",
                         "error": diagnostic_excerpt(schedule_error, 300),
                     })
+            if should_retry and auth_failures < 3:
                 auth_failures += 1
-            if auth_failure and not emitted and auth_failures < 2:
-                token = account_service.get_text_access_token(attempted_tokens)
-                if token:
+                next_token = account_service.get_text_access_token(attempted_tokens, model=request.model)
+                if next_token and next_token not in attempted_tokens:
+                    token = next_token
                     continue
             if token and not getattr(exc, "account_email", ""):
                 setattr(exc, "account_email", _text_account_email(token))
             raise
         finally:
             if active_backend is not None:
+                audit = getattr(active_backend, "web_text_audit", None)
+                if audit is not None:
+                    backend.web_text_audit = audit
                 active_backend.close()
 
 
@@ -1571,7 +1757,7 @@ def _cleanup_image_conversations_after_success(backend: OpenAIBackendAPI, output
     seen: set[str] = set()
     for output in outputs:
         conversation_id = str(getattr(output, "conversation_id", "") or "").strip()
-        if output.kind != "result" or not conversation_id or conversation_id in seen:
+        if not conversation_id or conversation_id in seen:
             continue
         seen.add(conversation_id)
         conversation_ids.append(conversation_id)
@@ -1927,295 +2113,6 @@ def stream_image_outputs(
         failure=failure,
     )
 
-def stream_image_outputs(
-        backend: OpenAIBackendAPI,
-        request: ConversationRequest,
-        index: int = 1,
-        total: int = 1,
-) -> Iterator[ImageOutput]:
-    """执行一张 ChatGPT 图片任务。
-
-    统一原则：上游 SSE 只负责启动/生成阶段；SSE 结束后只进入一次结果解析/轮询。
-    不再在文本回复、空结果、轮询超时后叠加多轮长重试，避免一个配置的 300 秒被隐式放大到十几分钟。
-    """
-    last: dict[str, Any] = {}
-    conversation_stream_started = time.perf_counter()
-    conversation_wall_started = time.time()
-    try:
-        for event in conversation_events(
-                backend,
-                prompt=request.prompt,
-                model=request.model,
-                images=request.images or [],
-                size=request.size,
-                quality=request.quality,
-        ):
-            last = event
-            if event.get("type") == "conversation.delta":
-                yield ImageOutput(
-                    kind="progress",
-                    model=request.model,
-                    index=index,
-                    total=total,
-                    text=str(event.get("delta") or ""),
-                    upstream_event_type="conversation.delta",
-                )
-                continue
-            if event.get("type") == "conversation.event":
-                raw = event.get("raw")
-                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-                yield ImageOutput(
-                    kind="progress",
-                    model=request.model,
-                    index=index,
-                    total=total,
-                    upstream_event_type=raw_type,
-                )
-    except (TimeoutError, curl_exceptions.Timeout) as exc:
-        yield _recover_after_image_stream_timeout(
-            backend,
-            request,
-            last,
-            exc,
-            index,
-            total,
-            conversation_wall_started,
-        )
-        return
-    except curl_exceptions.RequestException as exc:
-        if not any((
-            last.get("conversation_id"),
-            last.get("file_ids"),
-            last.get("sediment_ids"),
-        )):
-            raise
-        yield _recover_after_image_stream_timeout(
-            backend,
-            request,
-            last,
-            exc,
-            index,
-            total,
-            conversation_wall_started,
-            failure_code="image_stream_interrupted",
-        )
-        return
-
-    conversation_id = str(last.get("conversation_id") or "")
-    file_ids = [str(item) for item in last.get("file_ids") or []]
-    sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
-    message = str(last.get("text") or "").strip()
-    stream_failure = last.get("_image_failure")
-    stream_failure = stream_failure if isinstance(stream_failure, ImageFailure) else None
-    terminal_tool_arguments = last.get("_terminal_tool_arguments")
-    terminal_tool_arguments = (
-        terminal_tool_arguments if isinstance(terminal_tool_arguments, dict) else None
-    )
-    turn_use_case = str(last.get("turn_use_case") or "").strip().lower()
-    async_task_type = str(last.get("async_task_type") or "").strip().lower()
-    message_type = str(last.get("message_type") or "").strip().lower()
-    has_image_arguments = is_image_generation_arguments(
-        message,
-        role=str(last.get("message_role") or ""),
-        content_type=str(last.get("content_type") or ""),
-    )
-    should_poll_for_image = bool(
-        (
-            request.images
-            or turn_use_case == "image gen"
-            or async_task_type == "image_gen"
-            or message_type in {"image_gen", "image_generation"}
-            or has_image_arguments
-        )
-        and stream_failure is None
-    )
-    is_text_reply = bool(
-        stream_failure is not None
-        and stream_failure.code == "upstream_text_reply"
-    )
-    conversation_stream_ms = int((time.perf_counter() - conversation_stream_started) * 1000)
-    http_timing = _backend_http_timing_data(backend)
-    _monitor_image_stage(
-        request,
-        "image_stream_resolve_start",
-        conversation_id=conversation_id,
-        conversation_stream_ms=conversation_stream_ms,
-        index=index,
-        total=total,
-        **http_timing,
-    )
-    logger.info({
-        "event": "image_stream_resolve_start",
-        "call_id": request.call_id,
-        "conversation_id": conversation_id,
-        "file_ids": file_ids,
-        "sediment_ids": sediment_ids,
-        "tool_invoked": last.get("tool_invoked"),
-        "turn_use_case": turn_use_case,
-        "async_task_type": async_task_type,
-        "message_type": message_type,
-        "has_image_arguments": has_image_arguments,
-        "has_terminal_tool_arguments": terminal_tool_arguments is not None,
-        "is_text_reply": is_text_reply,
-        "should_poll_for_image": should_poll_for_image,
-        "conversation_stream_ms": conversation_stream_ms,
-        **http_timing,
-    })
-    if request.progress_callback:
-        request.progress_callback("image_stream_resolve_start")
-
-    if is_text_reply:
-        logger.info({
-            "event": "image_stream_text_reply_detected",
-            "conversation_id": conversation_id,
-            "message_preview": message[:200],
-        })
-
-    if terminal_tool_arguments is not None and not file_ids and not sediment_ids and stream_failure is None:
-        argument_text = str(terminal_tool_arguments.get("text") or message).strip()
-        terminal_failure = image_failure(
-            "image_tool_error",
-            raw_detail=argument_text,
-        )
-        yield ImageOutput(
-            kind="message",
-            model=request.model,
-            index=index,
-            total=total,
-            text=argument_text,
-            conversation_id=conversation_id,
-            failure=terminal_failure,
-        )
-        return
-    if not conversation_id and not file_ids and (sediment_ids or should_poll_for_image or stream_failure is not None):
-        conversation_id = _recover_image_conversation_id(
-            backend,
-            request,
-            reason="stream_result",
-            message=message,
-            started_at=conversation_wall_started,
-        )
-
-    if not file_ids and not sediment_ids and last.get("blocked"):
-        _task_failure, detailed_error = _get_detailed_failure_from_tasks(backend, conversation_id)
-        policy_failure = image_failure(
-            "content_policy_violation",
-            raw_detail=detailed_error or message,
-        )
-        yield ImageOutput(
-            kind="message",
-            model=request.model,
-            index=index,
-            total=total,
-            text=detailed_error or message or public_image_error_message(policy_failure),
-            conversation_id=conversation_id,
-            failure=policy_failure,
-        )
-        return
-
-    if is_text_reply and conversation_id and not file_ids and not sediment_ids:
-        task_failure, task_error = _get_detailed_failure_from_tasks(
-            backend,
-            conversation_id,
-            timeout_secs=5.0,
-            wait_secs=0.0,
-        )
-        previous_code = stream_failure.code
-        merged_failure = merge_message_failure(stream_failure, task_failure)
-        stream_failure = merged_failure
-        if task_failure is not None and merged_failure.code != previous_code:
-            stream_failure = merged_failure.with_raw_detail(
-                task_error or merged_failure.raw_detail or message
-            )
-            message = task_error or message
-            logger.info({
-                "event": "image_text_reply_structured_failure",
-                "conversation_id": conversation_id,
-                "failure_code": stream_failure.code,
-                "error": diagnostic_excerpt(message, 1000),
-            })
-
-    if stream_failure is not None and not file_ids and not sediment_ids:
-        yield ImageOutput(
-            kind="message",
-            model=request.model,
-            index=index,
-            total=total,
-            text=_failure_raw_text(stream_failure, message),
-            conversation_id=conversation_id,
-            failure=stream_failure,
-        )
-        return
-
-    if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
-        yield ImageOutput(
-            kind="message",
-            model=request.model,
-            index=index,
-            total=total,
-            text=message,
-            conversation_id=conversation_id,
-            failure=image_failure("no_image_generated", raw_detail=message),
-        )
-        return
-
-    image_urls = _resolve_image_urls_with_monitor(
-        backend,
-        request,
-        conversation_id,
-        file_ids,
-        sediment_ids,
-        poll_timeout_secs=config.image_poll_timeout_secs,
-        index=index,
-        total=total,
-    )
-    result_output = _image_result_output_from_urls(
-        backend,
-        request,
-        conversation_id,
-        image_urls,
-        index,
-        total,
-    )
-    if result_output:
-        yield result_output
-        return
-
-    if message and not should_poll_for_image:
-        yield ImageOutput(
-            kind="message",
-            model=request.model,
-            index=index,
-            total=total,
-            text=message,
-            conversation_id=conversation_id,
-            failure=stream_failure or image_failure("no_image_generated", raw_detail=message),
-        )
-        return
-
-    if conversation_id:
-        failure = image_failure("no_image_generated")
-        yield ImageOutput(
-            kind="message",
-            model=request.model,
-            index=index,
-            total=total,
-            text=public_image_error_message(failure),
-            conversation_id=conversation_id,
-            failure=failure,
-        )
-        return
-
-    failure = image_failure("no_image_generated")
-    yield ImageOutput(
-        kind="message",
-        model=request.model,
-        index=index,
-        total=total,
-        text=public_image_error_message(failure),
-        conversation_id=conversation_id,
-        failure=failure,
-    )
 
 def _codex_response_images(value: Any) -> list[str]:
     if isinstance(value, dict):
@@ -2802,11 +2699,13 @@ def _generate_single_image(
                         "status": "message",
                         "account_email": account_email,
                     })
+                _cleanup_image_conversations_after_success(backend, outputs)
                 return outputs
             if not returned_result:
                 missing_result_failure = image_failure("no_image_generated")
                 if emitted_for_token:
                     attempt_conversation_id = outputs[-1].conversation_id if outputs else ""
+                _cleanup_image_conversations_after_success(backend, outputs)
                 raise ImageGenerationError(
                     "upstream completed without generating images",
                     failure=missing_result_failure,
@@ -2967,6 +2866,11 @@ def _generate_single_image(
             attach_attempts(image_error)
             if retry_with_different_account(failure, image_error):
                 continue
+            if attempt_conversation_id and backend is not None:
+                try:
+                    backend.delete_conversation(attempt_conversation_id)
+                except Exception:
+                    pass
             if image_error is exc:
                 raise
             raise image_error from exc

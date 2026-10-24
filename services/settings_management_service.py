@@ -252,7 +252,7 @@ _FIELD_SPECS: dict[str, dict[str, Any]] = {
     "image_upscale_enabled": _field_metadata(False),
     "image_upscale_engine": _field_metadata("sharp_lanczos3", options=("sharp_lanczos3", "pillow_lanczos")),
     "image_max_account_attempts": _numeric_field_metadata("image_max_account_attempts"),
-    "image_remove_conversation_after_result": _field_metadata(False),
+    "image_remove_conversation_after_result": _field_metadata(True),
     "image_settle_enabled": _field_metadata(True),
     "image_settle_secs": _numeric_field_metadata("image_settle_secs"),
     "auto_remove_invalid_accounts": _field_metadata(True),

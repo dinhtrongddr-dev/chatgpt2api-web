@@ -17,7 +17,7 @@ from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import CurlInfo, CurlOpt, requests
+from curl_cffi import CurlHttpVersion, CurlInfo, CurlOpt, requests
 from PIL import Image
 
 from services.account_service import account_service
@@ -40,6 +40,9 @@ from services.image_failure import (
     terminal_assistant_text,
 )
 from services.protocol.reasoning import normalize_thinking_effort
+from services.web_text_transport import (
+    WebTextOutcomeUnknown, WebTextStreamAudit, checked_payloads, isolated_http1_enabled,
+)
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -232,6 +235,8 @@ class OpenAIBackendAPI:
         self._http_timings: dict[str, dict[str, Any]] = {}
         self._image_result_timing: dict[str, int] = {}
         self._closed = False
+        self.web_text_http1 = isolated_http1_enabled(Path(__file__).resolve().parents[1])
+        self.transport_request_id = new_uuid()
         explicit_proxy = str(proxy or proxy_url or "").strip()
         self.proxy_profile = proxy_profile or proxy_settings.get_profile(
             account=self.account,
@@ -241,6 +246,8 @@ class OpenAIBackendAPI:
             deadline_monotonic=deadline_monotonic,
         )
         try:
+            if self.web_text_http1 and bool(getattr(self.proxy_profile, "skip_ssl_verify", False)):
+                raise ValueError("WEB_TEXT_TRANSPORT_REQUIRES_TLS_VERIFY")
             self.session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
                 self.proxy_profile,
                 impersonate=self.fp["impersonate"],
@@ -705,6 +712,16 @@ class OpenAIBackendAPI:
                 part_type = str(part.get("type") or "")
                 if part_type == "text":
                     text_parts.append(str(part.get("text") or ""))
+                elif part_type == "image_url":
+                    img_dict = part.get("image_url") or {}
+                    url_val = img_dict.get("url", "") if isinstance(img_dict, dict) else str(img_dict)
+                    if url_val.startswith("data:"):
+                        header, b64_str = url_val.split(",", 1)
+                        mime = header.split(";")[0].replace("data:", "").strip() or "image/png"
+                        try:
+                            image_inputs.append((base64.b64decode(b64_str), mime))
+                        except Exception:
+                            pass
                 elif part_type == "image":
                     data = part.get("data")
                     mime = str(part.get("mime") or "image/png")
@@ -993,23 +1010,49 @@ class OpenAIBackendAPI:
             "protocol": "f-conversation",
             "model": model_slug,
         })
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=300,
-            stream=True,
-        )
+        audit = WebTextStreamAudit(self.transport_request_id) if self.web_text_http1 else None
+        self.web_text_audit = audit
+        response = None
         conversation_id = ""
         try:
+            # Per-request override: never force image/search/bootstrap sessions
+            # or the default service to HTTP/1.1. No automatic POST retry.
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                json=payload, timeout=1200, stream=True,
+                **({"http_version": CurlHttpVersion.V1_1} if audit else {}),
+            )
+            if audit:
+                audit.headers_ms = audit.elapsed_ms()
+                version = getattr(response, "http_version", None)
+                audit.actual_http_version = int(version) if isinstance(version, int) else None
+                infos = getattr(response, "infos", None)
+                ttfb = infos.get(CurlInfo.STARTTRANSFER_TIME) if isinstance(infos, dict) else None
+                audit.ttfb_ms = round(ttfb * 1000) if isinstance(ttfb, (int, float)) and ttfb >= 0 else None
             ensure_ok(response, path)
-            for payload_item in iter_sse_payloads(response, max_duration_secs=300):
+            payloads = iter_sse_payloads(response, max_duration_secs=1200)
+            for payload_item in checked_payloads(payloads, audit) if audit else payloads:
                 if payload_item != "[DONE]" and not conversation_id:
                     conversation_id = self._find_search_value(payload_item, "conversation_id")
                 yield payload_item
+        except Exception as exc:
+            if audit:
+                audit.failed(exc)
+                if isinstance(exc, (WebTextOutcomeUnknown, ConnectionError, TimeoutError, requests.exceptions.RequestException)):
+                    failure = WebTextOutcomeUnknown(audit.failure_code)
+                    failure.failure = image_failure(audit.failure_code.lower())
+                    failure.transport_audit = audit
+                    raise failure from exc
+            raise
         finally:
-            response.close()
-            self._hide_web_text_conversation(conversation_id, protocol="f-conversation")
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                if audit:
+                    logger.info(audit.fields())
+                self._hide_web_text_conversation(conversation_id, protocol="f-conversation")
 
     def _hide_web_text_conversation(self, conversation_id: str, *, protocol: str) -> None:
         """Hide gateway-created Web text turns from the account's sidebar.
@@ -1216,15 +1259,30 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json()
 
-    def delete_conversation(self, conversation_id: str, timeout_secs: float = 10.0) -> Dict[str, Any]:
+    def delete_conversation(self, conversation_id: str, timeout_secs: float = 20.0) -> Dict[str, Any]:
         """隐藏 ChatGPT 官网历史里的 conversation。"""
+        conversation_id = str(conversation_id or "").strip()
+        if not conversation_id:
+            return {}
         path = f"/backend-api/conversation/{conversation_id}"
         headers = self._headers(path, {
             "Accept": "*/*",
             "Content-Type": "application/json",
             "Referer": f"{self.base_url}/c/{conversation_id}",
-            "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}",
         })
+        account_id = ""
+        if self.access_token:
+            try:
+                claims = account_service._decode_jwt_payload(self.access_token)
+                auth_claims = claims.get("https://api.openai.com/auth") or {}
+                account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
+            except Exception:
+                pass
+        if not account_id and isinstance(self.account, dict):
+            account_id = str(self.account.get("account_id") or "").strip()
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+
         response = self.session.patch(
             self.base_url + path,
             headers=headers,
@@ -1232,6 +1290,8 @@ class OpenAIBackendAPI:
             timeout=timeout_secs,
         )
         try:
+            if response.status_code == 404:
+                return {"success": True}
             ensure_ok(response, path)
         except Exception as exc:
             if classify_image_exception(exc).capability == "auth":
@@ -1242,7 +1302,7 @@ class OpenAIBackendAPI:
             # parsing it can block on a half-closed HTTP/2 stream. Closing the
             # response immediately keeps cleanup bounded and repeatable.
             response.close()
-        return {}
+        return {"success": True}
 
     def _list_recent_conversations(self, limit: int = 5, timeout_secs: float = 10.0) -> list[Dict[str, Any]]:
         """列出最近的对话列表，按更新时间倒序。
@@ -3423,33 +3483,45 @@ class OpenAIBackendAPI:
         normalized = messages or [{"role": "user", "content": prompt}]
         self._bootstrap()
         requirements = self._get_chat_requirements()
-        try:
-            yield from self._stream_web_text_f_conversation(
-                normalized,
-                model,
-                requirements,
-                thinking_effort=thinking_effort,
-            )
-            return
-        except UpstreamHTTPError as exc:
-            # Some Web accounts may still be on the legacy route during the
-            # rollout.  Keep a bounded Web-only fallback for route misses;
-            # authentication and entitlement errors must remain visible.
-            if exc.status_code not in {404, 405}:
-                raise
-            logger.warning({
-                "event": "web_conversation_protocol_fallback",
-                "from_protocol": "f-conversation",
-                "to_protocol": "legacy-conversation",
-                "status_code": exc.status_code,
-            })
+
+        def _has_multimodal_content(msgs: list[Dict[str, Any]]) -> bool:
+            for m in msgs:
+                c = m.get("content")
+                if isinstance(c, list):
+                    for p in c:
+                        if isinstance(p, dict) and str(p.get("type") or "") in {"image", "image_url"}:
+                            return True
+            return False
+
+        has_multimodal = bool(images) or _has_multimodal_content(normalized)
+        if not has_multimodal:
+            try:
+                yield from self._stream_web_text_f_conversation(
+                    normalized,
+                    model,
+                    requirements,
+                    thinking_effort=thinking_effort,
+                )
+                return
+            except UpstreamHTTPError as exc:
+                # Some Web accounts may still be on the legacy route during the
+                # rollout.  Keep a bounded Web-only fallback for route misses;
+                # authentication and entitlement errors must remain visible.
+                if self.web_text_http1 or exc.status_code not in {404, 405, 413}:
+                    raise
+                logger.warning({
+                    "event": "web_conversation_protocol_fallback",
+                    "from_protocol": "f-conversation",
+                    "to_protocol": "legacy-conversation",
+                    "status_code": exc.status_code,
+                })
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
             json=payload,
-            timeout=300,
+            timeout=1200,
             stream=True,
         )
         ensure_ok(response, path)
@@ -3460,7 +3532,7 @@ class OpenAIBackendAPI:
                 "protocol": "legacy-conversation",
                 "model": model,
             })
-            for payload_item in iter_sse_payloads(response, max_duration_secs=300):
+            for payload_item in iter_sse_payloads(response, max_duration_secs=1200):
                 if payload_item != "[DONE]" and not conversation_id:
                     conversation_id = self._find_search_value(payload_item, "conversation_id")
                 yield payload_item

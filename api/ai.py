@@ -165,6 +165,8 @@ def create_router() -> APIRouter:
         return await call.run(openai_v1_image_edit.handle, payload)
 
     @router.post("/v1/chat/completions")
+    @router.post("/chat/completions")
+    @router.post("/v1/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
@@ -207,6 +209,8 @@ def create_router() -> APIRouter:
         return await call.run(openai_v1_response.handle, payload)
 
     @router.post("/v1/messages")
+    @router.post("/messages")
+    @router.post("/v1/v1/messages")
     async def create_message(
             body: AnthropicMessageRequest,
             authorization: str | None = Header(default=None),

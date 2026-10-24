@@ -65,6 +65,12 @@ class ImageFailure:
 
 
 FAILURE_POLICIES: dict[str, FailurePolicy] = {
+    "http2_stream_interrupted": FailurePolicy(
+        "transient", None, False, 502, "server_error",
+    ),
+    "upstream_outcome_unknown": FailurePolicy(
+        "transient", None, False, 502, "server_error",
+    ),
     "upstream_error": FailurePolicy(
         "transient", None, False, 502, "server_error",
         verify_account=True,

@@ -872,6 +872,28 @@ class AccountService:
         }
         return bool(normalized_account and normalized_account in normalized_plans)
 
+    @classmethod
+    def _is_paid_model(cls, model: str) -> bool:
+        if not model:
+            return False
+        m = model.lower().strip()
+        paid_patterns = (
+            "gpt-6", "gpt-5", "o1", "o3", "astra", "sol", "thinking", "research", "deep-research", "pro"
+        )
+        return any(p in m for p in paid_patterns)
+
+    @classmethod
+    def _is_paid_account(cls, account: dict) -> bool:
+        if not isinstance(account, dict):
+            return False
+        account_type = cls._normalize_account_type(account.get("type"))
+        if account_type:
+            return account_type.lower() != "free"
+        default_model = str(account.get("default_model_slug") or "").lower()
+        if cls._is_paid_model(default_model):
+            return True
+        return False
+
     @staticmethod
     def _normalize_source_type(value: object) -> str:
         raw = str(value or "").strip().lower()
@@ -1319,7 +1341,11 @@ class AccountService:
                     data={
                         "grant_type": "refresh_token",
                         "refresh_token": refresh_token,
-                        "client_id": self._OAUTH_CLIENT_ID,
+                        "client_id": (
+                            "app_EMoamEEZ73f0CkXaXp7hrann"
+                            if self._normalize_source_type((account or {}).get("source_type")) == "codex"
+                            else self._OAUTH_CLIENT_ID
+                        ),
                     },
                     timeout=60,
                 )
@@ -2089,9 +2115,10 @@ class AccountService:
             f"no image account available after {len(attempted_tokens)} attempts",
         )
 
-    def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
+    def get_text_access_token(self, excluded_tokens: set[str] | None = None, model: str = "") -> str:
         self._refresh_accounts_snapshot_if_stale()
         attempted = set(excluded_tokens or set())
+        needs_paid = self._is_paid_model(model)
         while True:
             with self._lock:
                 candidates = [
@@ -2102,6 +2129,7 @@ class AccountService:
                         allow_limited=True,
                         allow_image_pending=True,
                     )
+                    and (not needs_paid or self._is_paid_account(account))
                     and (token := account.get("access_token") or "")
                     and token not in attempted
                 ]

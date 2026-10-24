@@ -25,6 +25,7 @@ from services.image_failure import (
 )
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from services.realtime_monitor_service import realtime_monitor_service
+from services.web_text_transport import WebTextOutcomeUnknown, WebTextStreamAudit, safe_transport_fields
 from utils.diagnostics import (
     diagnostic_excerpt,
     exception_diagnostic_fields,
@@ -38,6 +39,7 @@ from utils.timezone import beijing_from_timestamp, beijing_now_str
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {
+    "_web_text_transport",
     "_account_email",
     "_call_error",
     "_conversation_id",
@@ -403,6 +405,9 @@ def _request_full_text(text: object, limit: int = REQUEST_TEXT_FULL_LIMIT) -> tu
 
 def _exception_log_fields(exc: Exception, *, image: bool = False) -> dict[str, object]:
     fields = exception_diagnostic_fields(exc, include_status_code=True)
+    audit = getattr(exc, "transport_audit", None)
+    if isinstance(exc, WebTextOutcomeUnknown) and isinstance(audit, WebTextStreamAudit):
+        fields["web_text_transport"] = safe_transport_fields(audit.fields())
     attempts = collect_image_attempts(exc)
     if attempts:
         fields["image_attempts"] = attempts
@@ -457,6 +462,8 @@ def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSON
     message = str(exc)
     if sse == "anthropic":
         return anthropic_error_response(message, status_code)
+    if isinstance(exc, WebTextOutcomeUnknown):
+        return openai_error_response(exc.to_openai_error(), status_code)
     return openai_error_response(message, status_code)
 
 
@@ -548,6 +555,9 @@ class LoggedCall:
                 projected_status = "success"
             projected_error = str(result.get("_call_error") or "").strip()
             projected_extra: dict[str, object] = {}
+            transport = safe_transport_fields(result.get("_web_text_transport"))
+            if transport:
+                projected_extra["web_text_transport"] = transport
             if projected_status != "success" and result.get("error_code"):
                 projected_extra["error_code"] = result["error_code"]
             self.log(
@@ -651,6 +661,9 @@ class LoggedCall:
         image_request = self._is_image_request()
         try:
             for item in items:
+                transport = safe_transport_fields(item.get("_web_text_transport")) if isinstance(item, dict) else None
+                if transport:
+                    result_metrics["web_text_transport"] = transport
                 if image_request:
                     for key, value in image_result_metrics(item).items():
                         if key == "result_images":

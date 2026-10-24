@@ -44,6 +44,8 @@ data/
 *.sqlite
 *.sqlite3
 postgres-data/
+*_session.json
+codex_session.json
 
 # Logs & Debug
 /logs/
