@@ -36,6 +36,25 @@ $bundled = Join-Path $Root 'runtime\python\python.exe'
 if ($py -eq $bundled) {
     $target = $bundled
 } else {
+    # A half-made / copied .venv (no pyvenv.cfg, or its base Python is gone) makes python.exe show
+    # "Python venv launcher is sorry to say ... failed to locate pyvenv.cfg": rebuild it.
+    $venvDir = Join-Path $Root '.venv'
+    $cfg = Join-Path $venvDir 'pyvenv.cfg'
+    if ((Test-Path $venvDir) -and -not $Force) {
+        $homeLine = if (Test-Path $cfg) { Get-Content $cfg | Where-Object { $_ -match '^\s*home\s*=' } | Select-Object -First 1 }
+        $homeDir = if ($homeLine) { ($homeLine -split '=', 2)[1].Trim() } else { '' }
+        if (-not (Test-Path $venvPy) -or -not $homeDir -or
+            -not (Test-Path -LiteralPath ($homeDir.TrimEnd('\') + '\python.exe'))) {
+            Write-Host '.venv bi hong: xoa de tao lai...' -ForegroundColor Yellow
+            $Force = $true
+        }
+    }
+    if ($Force -and (Test-Path $venvDir)) {
+        Get-Process python*, pythonw* -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path.StartsWith($venvDir, [StringComparison]::OrdinalIgnoreCase) } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Remove-Item $venvDir -Recurse -Force
+    }
     if ($Force -or -not (Test-Path $venvPy)) {
         & $py -m venv (Join-Path $Root '.venv')
     }
