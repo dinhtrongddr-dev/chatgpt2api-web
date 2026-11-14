@@ -37,11 +37,21 @@ from pystray import MenuItem as item, Menu
 from PIL import Image, ImageDraw
 
 APP_DIR = Path(__file__).resolve().parent
-PYTHON_EXE = r"D:\chatgpt2api\backend\python\python.exe"
-PYTHONW_EXE = r"D:\chatgpt2api\backend\python\pythonw.exe"
-if not os.path.exists(PYTHON_EXE):
+
+# Local runtime resolution: prioritize internal runtime, then venv, then sys.executable
+LOCAL_PYTHON = APP_DIR / "runtime" / "python" / "python.exe"
+LOCAL_PYTHONW = APP_DIR / "runtime" / "python" / "pythonw.exe"
+VENV_PYTHON = APP_DIR / ".venv" / "Scripts" / "python.exe"
+VENV_PYTHONW = APP_DIR / ".venv" / "Scripts" / "pythonw.exe"
+
+if LOCAL_PYTHON.exists():
+    PYTHON_EXE = str(LOCAL_PYTHON)
+    PYTHONW_EXE = str(LOCAL_PYTHONW) if LOCAL_PYTHONW.exists() else str(LOCAL_PYTHON)
+elif VENV_PYTHON.exists():
+    PYTHON_EXE = str(VENV_PYTHON)
+    PYTHONW_EXE = str(VENV_PYTHONW) if VENV_PYTHONW.exists() else str(VENV_PYTHON)
+else:
     PYTHON_EXE = sys.executable
-if not os.path.exists(PYTHONW_EXE):
     PYTHONW_EXE = sys.executable
 
 DATA_DIR = APP_DIR / "data"
@@ -147,8 +157,24 @@ tray_icon = None
 should_exit = False
 
 
+def _new_auth_key() -> str:
+    import secrets
+    return "sk-" + secrets.token_urlsafe(24)
+
+
+def _ensure_auth_key_in_env() -> str:
+    """No key is ever hard-coded: the first start writes a random one into .env."""
+    key = _new_auth_key()
+    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    lines = [ln for ln in lines if not ln.strip().startswith("CHATGPT2API_AUTH_KEY=")]
+    lines.append(f"CHATGPT2API_AUTH_KEY={key}")
+    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log_tray("Generated a new local auth key in .env")
+    return key
+
+
 def load_config():
-    auth_key = "sk-yeZIi4tv0OUtk3ef0ygLZL6PWDSCXdO5"
+    auth_key = ""
     port = 13000
     host = "127.0.0.1"
 
@@ -183,7 +209,24 @@ def load_config():
                     port = int(data["port"])
         except Exception:
             pass
+    if not auth_key:
+        auth_key = _ensure_auth_key_in_env()
     return host, port, auth_key
+
+
+def _rotate_log(path: Path, limit_mb: int = 10, keep: int = 2) -> None:
+    """service.log grew to 23 MB+: keep the current file under limit_mb, plus `keep` old ones."""
+    try:
+        if path.exists() and path.stat().st_size > limit_mb * 1024 * 1024:
+            for i in range(keep, 0, -1):
+                older = path.with_name(f"{path.name}.{i}")
+                newer = path.with_name(f"{path.name}.{i - 1}") if i > 1 else path
+                if newer.exists():
+                    if older.exists():
+                        older.unlink()
+                    newer.rename(older)
+    except OSError:
+        pass
 
 
 def is_port_listening(port, host="127.0.0.1"):
@@ -275,6 +318,7 @@ def start_backend():
     env["PYTHONUNBUFFERED"] = "1"
 
     creation_flags = 0x08000000  # CREATE_NO_WINDOW
+    _rotate_log(LOG_FILE)
     log_fp = open(LOG_FILE, "a", encoding="utf-8")
 
     server_process = subprocess.Popen(

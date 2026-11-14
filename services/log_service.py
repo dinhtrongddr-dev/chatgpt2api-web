@@ -26,6 +26,7 @@ from services.image_failure import (
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from services.realtime_monitor_service import realtime_monitor_service
 from services.web_text_transport import WebTextOutcomeUnknown, WebTextStreamAudit, safe_transport_fields
+from services.web_text_recovery import WebTextNoConversation, WebTextNotDispatched
 from utils.diagnostics import (
     diagnostic_excerpt,
     exception_diagnostic_fields,
@@ -464,6 +465,8 @@ def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSON
         return anthropic_error_response(message, status_code)
     if isinstance(exc, WebTextOutcomeUnknown):
         return openai_error_response(exc.to_openai_error(), status_code)
+    if isinstance(exc, (WebTextNotDispatched, WebTextNoConversation)):
+        return openai_error_response(exc.to_openai_error(), exc.status_code)
     return openai_error_response(message, status_code)
 
 

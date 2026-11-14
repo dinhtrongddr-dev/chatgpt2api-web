@@ -890,7 +890,13 @@ def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_te
             continue
         text = assistant_message_text(message)
         if text:
-            return strip_history(text, history_text)
+            snapshot = strip_history(text, history_text)
+            # 2026-11-12 (owner-authorized): a full-message snapshot that lags behind the text already
+            # built from patches must not rewind it. Rewinding dropped the next patch's context and the
+            # delta logic then re-sent the whole text, so clients received duplicated, interleaved prose.
+            if current_text and len(snapshot) < len(current_text) and current_text.startswith(snapshot):
+                return current_text
+            return snapshot
     return apply_text_patch(event, current_text, history_text)
 
 
@@ -1147,6 +1153,8 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "async_task_type": state.async_task_type,
         "message_type": state.message_type,
         "message_role": str(state.message_facts.get("role") or ""),
+        "message_status": str(state.message_facts.get("status") or ""),
+        "message_end_turn": state.message_facts.get("end_turn"),
         "content_type": str(state.message_facts.get("content_type") or ""),
         "_terminal_tool_arguments": (
             dict(state.terminal_tool_arguments)
@@ -1167,6 +1175,14 @@ def iter_conversation_payloads(
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
+    # 2026-11-12 (owner-authorized): long answers arrive on several channels ("c"): a streaming parent,
+    # the visible answer (named by the final_channel_token / user_visible_token marker) and a
+    # continuation, each carrying copies of the same text. Text is built per channel and only the
+    # visible channel is emitted; mixing them duplicated every chunk. Streams without "c" are unchanged.
+    channel_raw: dict[int, str] = {}
+    channel_of_message: dict[str, int] = {}
+    visible_message_id = ""
+    last_channel: int | None = None
     for payload in payloads:
         # print(f"[upstream_sse] {payload}", flush=True)
         if not payload:
@@ -1188,10 +1204,34 @@ def iter_conversation_payloads(
         if not isinstance(event, dict):
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
-        if event.get("error_code") == "usage_limit" or (event.get("error") and not event.get("message") and not event.get("p")):
-            err_msg = str(event.get("error") or "usage_limit")
-            raise UpstreamHTTPError(429, {"message": f"PROVIDER_USAGE_LIMIT: {err_msg}", "code": "usage_limit", "error_code": "usage_limit"})
-        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
+        error = event.get("error")
+        nested_code = error.get("code") or error.get("error_code") if isinstance(error, dict) else None
+        if event.get("error_code") == "usage_limit" or event.get("code") == "usage_limit" or nested_code == "usage_limit":
+            # An error inside HTTP200 SSE is not an observed HTTP429 response.
+            # Preserve its explicit provenance without logging raw provider text.
+            raise ValueError("UPSTREAM_SSE_USAGE_LIMIT")
+        if error and not event.get("message") and not event.get("p"):
+            raise ValueError("UPSTREAM_SSE_ERROR_UNVERIFIED")
+        if event.get("type") == "message_marker" and event.get("marker") in {"final_channel_token", "user_visible_token"}:
+            visible_message_id = str(event.get("message_id") or "") or visible_message_id
+        channel = event.get("c") if isinstance(event.get("c"), int) and not isinstance(event.get("c"), bool) else None
+        if channel is not None or channel_raw:
+            if channel is None:
+                channel = last_channel
+            last_channel = channel
+            for candidate in (event, event.get("v")):
+                message = candidate.get("message") if isinstance(candidate, dict) else None
+                if isinstance(message, dict) and message.get("id") and channel is not None:
+                    channel_of_message.setdefault(str(message["id"]), channel)
+            if channel is not None:
+                channel_raw[channel] = assistant_raw_text(event, channel_raw.get(channel, ""), history_text)
+            visible = channel_of_message.get(visible_message_id)
+            if visible is None:
+                # Before the marker names the visible answer, follow the first channel that has text.
+                visible = next((c for c, t in channel_raw.items() if t), None)
+            next_raw_text = channel_raw.get(visible, "") if visible is not None else state.raw_text
+        else:
+            next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         update_conversation_state(
             state,
             payload,
@@ -1207,6 +1247,10 @@ def iter_conversation_payloads(
         next_text = sanitize_output_text(next_raw_text, is_streaming=True)
         state.raw_text = next_raw_text
         if next_text != state.text:
+            if channel_raw and not next_text.startswith(state.text) and state.text.startswith(next_text):
+                # Switching to the visible channel while it is still behind what was sent: wait for it.
+                yield conversation_base_event("conversation.event", state, raw=event)
+                continue
             delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
             state.text = next_text
             yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
@@ -1237,12 +1281,17 @@ def conversation_events(
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
     )
-    yield from iter_conversation_payloads(
-        payloads,
-        history_text,
-        history_messages,
-        classify_terminal_text_as_image_failure=image_model,
-    )
+    try:
+        yield from iter_conversation_payloads(
+            payloads,
+            history_text,
+            history_messages,
+            classify_terminal_text_as_image_failure=image_model,
+        )
+    finally:
+        close = getattr(payloads, "close", None)
+        if callable(close):
+            close()
 
 
 def _text_account_email(access_token: str) -> str:

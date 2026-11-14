@@ -1,4 +1,4 @@
 @echo off
 rem ChatGPT2API (Web Edition) - Start Tray & Server
-cd /d "D:\chatgpt2api-web"
-start "" wscript.exe "D:\chatgpt2api-web\start_tray.vbs"
+cd /d "%~dp0"
+start "" wscript.exe "%~dp0start_tray.vbs"

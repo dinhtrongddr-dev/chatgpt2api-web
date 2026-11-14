@@ -43,6 +43,9 @@ from services.protocol.reasoning import normalize_thinking_effort
 from services.web_text_transport import (
     WebTextOutcomeUnknown, WebTextStreamAudit, checked_payloads, isolated_http1_enabled,
 )
+from services.web_text_recovery import (
+    WebTextNoConversation, WebTextRecoveryFailed, curl_code_of, is_transport_error, recover_assistant_message, run_predispatch,
+)
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -973,7 +976,9 @@ class OpenAIBackendAPI:
         ]
         prompt = str(((user_messages[-1].get("content") or {}).get("parts") or [""])[0]) if user_messages else ""
         model_slug = self._web_text_model_slug(model)
-        conduit_token = self._prepare_text_conversation(prompt, model_slug)
+        conduit_token = run_predispatch(
+            "prepare", lambda: self._prepare_text_conversation(prompt, model_slug), on_retry=self._log_predispatch_retry,
+        )
         path = "/backend-api/f/conversation"
         payload = {
             "action": "next",
@@ -1014,6 +1019,8 @@ class OpenAIBackendAPI:
         self.web_text_audit = audit
         response = None
         conversation_id = ""
+        started = time.monotonic()
+        done_seen = False
         try:
             # Per-request override: never force image/search/bootstrap sessions
             # or the default service to HTTP/1.1. No automatic POST retry.
@@ -1032,11 +1039,32 @@ class OpenAIBackendAPI:
                 audit.ttfb_ms = round(ttfb * 1000) if isinstance(ttfb, (int, float)) and ttfb >= 0 else None
             ensure_ok(response, path)
             payloads = iter_sse_payloads(response, max_duration_secs=1200)
-            for payload_item in checked_payloads(payloads, audit) if audit else payloads:
-                if payload_item != "[DONE]" and not conversation_id:
-                    conversation_id = self._find_search_value(payload_item, "conversation_id")
-                yield payload_item
+            # 2026-11-12 diagnosis (owner-authorized, off by default): copy raw text SSE payloads to a file
+            # when CHATGPT2API_SSE_CAPTURE_DIR is set, to find why streamed chunks sometimes arrive twice.
+            from utils.helper import capture_sse_payloads
+            payloads = capture_sse_payloads(payloads, getattr(self, "transport_request_id", "") or "")
+            try:
+                for payload_item in checked_payloads(payloads, audit) if audit else payloads:
+                    if payload_item == "[DONE]":
+                        done_seen = True
+                    elif not conversation_id:
+                        conversation_id = self._find_search_value(payload_item, "conversation_id")
+                    yield payload_item
+            except Exception as stream_exc:
+                if done_seen or not conversation_id or not is_transport_error(stream_exc):
+                    raise
+                response.close()
+                response = None
+                yield from self._recover_web_text(conversation_id, started, stream_exc, "f-conversation")
+                return
+            if not done_seen and conversation_id:
+                yield from self._recover_web_text(conversation_id, started, None, "f-conversation")
         except Exception as exc:
+            if not audit and not done_seen and not conversation_id and is_transport_error(exc):
+                # Nothing to read back; mark it so an owner-approved client may resend content-only work once.
+                logger.warning({"event": "web_text_unknown_no_conversation", "protocol": "f-conversation",
+                                "curl_code": curl_code_of(exc), "elapsed_ms": int((time.monotonic() - started) * 1000)})
+                raise WebTextNoConversation(exc) from exc
             if audit:
                 audit.failed(exc)
                 if isinstance(exc, (WebTextOutcomeUnknown, ConnectionError, TimeoutError, requests.exceptions.RequestException)):
@@ -1053,6 +1081,49 @@ class OpenAIBackendAPI:
                 if audit:
                     logger.info(audit.fields())
                 self._hide_web_text_conversation(conversation_id, protocol="f-conversation")
+
+    def _log_predispatch_retry(self, stage: str, attempt: int, exc: BaseException) -> None:
+        logger.warning({
+            "event": "web_text_predispatch_retry",
+            "stage": stage,
+            "attempt": attempt,
+            "curl_code": curl_code_of(exc),
+            "error": diagnostic_excerpt(exc, 300),
+        })
+
+    def _recover_web_text(
+            self,
+            conversation_id: str,
+            started: float,
+            cause: BaseException | None,
+            protocol: str,
+    ) -> Iterator[str]:
+        """Read back a turn whose SSE broke after the conversation existed.
+
+        GET only: the POST is never replayed. On failure the original transport
+        error propagates unchanged, so the outcome stays UNKNOWN for the client.
+        """
+        logger.warning({
+            "event": "web_text_stream_recovery_started",
+            "protocol": protocol,
+            "curl_code": curl_code_of(cause) if cause else None,
+            "reason": "transport_error" if cause else "eof_without_done",
+        })
+        try:
+            message = recover_assistant_message(
+                lambda cid: self._get_conversation(cid, timeout_secs=30),
+                conversation_id,
+                deadline=started + 1200,
+            )
+        except WebTextRecoveryFailed as failure:
+            logger.warning({"event": "web_text_stream_recovery_failed", "protocol": protocol, "reason": str(failure)})
+            if cause is not None:
+                raise cause
+            raise ConnectionError("UPSTREAM_OUTCOME_UNKNOWN: stream ended without [DONE]; recovery failed") from failure
+        logger.info({"event": "web_text_stream_recovered", "protocol": protocol,
+                     "elapsed_ms": int((time.monotonic() - started) * 1000)})
+        yield json.dumps({"message": message, "conversation_id": conversation_id}, ensure_ascii=False)
+        yield "[DONE]"
 
     def _hide_web_text_conversation(self, conversation_id: str, *, protocol: str) -> None:
         """Hide gateway-created Web text turns from the account's sidebar.
@@ -3481,8 +3552,10 @@ class OpenAIBackendAPI:
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
-        self._bootstrap()
-        requirements = self._get_chat_requirements()
+        # Nothing has been sent to the model yet: bounded retries are safe, and a
+        # final failure is reported as not-dispatched (503), never as UNKNOWN.
+        run_predispatch("bootstrap", self._bootstrap, on_retry=self._log_predispatch_retry)
+        requirements = run_predispatch("chat_requirements", self._get_chat_requirements, on_retry=self._log_predispatch_retry)
 
         def _has_multimodal_content(msgs: list[Dict[str, Any]]) -> bool:
             for m in msgs:
@@ -3507,7 +3580,7 @@ class OpenAIBackendAPI:
                 # Some Web accounts may still be on the legacy route during the
                 # rollout.  Keep a bounded Web-only fallback for route misses;
                 # authentication and entitlement errors must remain visible.
-                if self.web_text_http1 or exc.status_code not in {404, 405, 413}:
+                if getattr(self, "studio_receipts_strict", False) or self.web_text_http1 or exc.status_code not in {404, 405, 413}:
                     raise
                 logger.warning({
                     "event": "web_conversation_protocol_fallback",
@@ -3526,16 +3599,31 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         conversation_id = ""
+        started = time.monotonic()
+        done_seen = False
         try:
             logger.info({
                 "event": "web_conversation_protocol",
                 "protocol": "legacy-conversation",
                 "model": model,
             })
-            for payload_item in iter_sse_payloads(response, max_duration_secs=1200):
-                if payload_item != "[DONE]" and not conversation_id:
-                    conversation_id = self._find_search_value(payload_item, "conversation_id")
-                yield payload_item
+            try:
+                for payload_item in iter_sse_payloads(response, max_duration_secs=1200):
+                    if payload_item == "[DONE]":
+                        done_seen = True
+                    elif not conversation_id:
+                        conversation_id = self._find_search_value(payload_item, "conversation_id")
+                    yield payload_item
+            except Exception as stream_exc:
+                if not done_seen and not conversation_id and is_transport_error(stream_exc):
+                    raise WebTextNoConversation(stream_exc) from stream_exc
+                if done_seen or not conversation_id or not is_transport_error(stream_exc):
+                    raise
+                response.close()
+                yield from self._recover_web_text(conversation_id, started, stream_exc, "legacy-conversation")
+                return
+            if not done_seen and conversation_id:
+                yield from self._recover_web_text(conversation_id, started, None, "legacy-conversation")
         finally:
             response.close()
             self._hide_web_text_conversation(conversation_id, protocol="legacy-conversation")

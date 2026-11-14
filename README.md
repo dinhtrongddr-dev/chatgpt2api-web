@@ -232,3 +232,15 @@ curl http://<IP-VPS>:3000/v1/chat/completions \
 
 ## 📄 License
 Dự án được phân phối dưới giấy phép **AGPL-3.0 License**.
+
+## Cài trên máy Windows mới (1 lệnh)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+`setup.ps1` tự kiểm tra Python 3.13+ (dùng `runtime\python` nếu có, không có thì cài qua winget), tạo `.venv`, cài hoặc sửa thư viện còn thiếu (`pip check`), và tạo `.env` với auth key ngẫu nhiên tại `127.0.0.1:13000`. Sau đó chạy `start.cmd`.
+
+- Không ghi cứng auth key trong mã nguồn: lần chạy đầu `tray.py` tự sinh key vào `.env` nếu chưa có.
+- `service.log` tự xoay vòng khi vượt 10 MB (giữ 2 bản cũ).
+

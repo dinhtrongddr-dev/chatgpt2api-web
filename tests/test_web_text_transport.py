@@ -28,6 +28,7 @@ from services.web_text_transport import (
     text_transport_request_id,
     safe_transport_fields,
 )
+from services.web_text_recovery import WebTextNoConversation, curl_code_of, is_transport_error, run_predispatch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,7 +37,9 @@ def load_method():
     tree = ast.parse((ROOT / "services/openai_backend_api.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "OpenAIBackendAPI")
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_stream_web_text_f_conversation")
-    namespace = dict(Iterator=object, Dict=dict, Any=object, ChatRequirements=object)
+    namespace = dict(Iterator=object, Dict=dict, Any=object, ChatRequirements=object, time=time, json=json,
+                     run_predispatch=run_predispatch, is_transport_error=is_transport_error,
+                     WebTextNoConversation=WebTextNoConversation, curl_code_of=curl_code_of)
     namespace.update(CurlHttpVersion=CurlHttpVersion, CurlInfo=CurlInfo, requests=requests, WebTextStreamAudit=WebTextStreamAudit,
                      WebTextOutcomeUnknown=WebTextOutcomeUnknown, checked_payloads=checked_payloads,
                      normalize_thinking_effort=lambda s: s, logger=Mock(),
@@ -171,7 +174,8 @@ class StreamTests(unittest.TestCase):
         backend = types.SimpleNamespace(web_text_http1=http1, transport_request_id="req", base_url="https://not-called.invalid",
             _web_text_message=lambda x: dict(author={"role": "user"}, content={"parts": [x["content"]]}),
             _web_text_model_slug=lambda x: x, _prepare_text_conversation=Mock(return_value="never-log"),
-            _image_headers=lambda *x: {}, _find_search_value=lambda *x: "", _hide_web_text_conversation=Mock(), session=Mock())
+            _image_headers=lambda *x: {}, _find_search_value=lambda *x: "", _hide_web_text_conversation=Mock(), session=Mock(),
+            _log_predispatch_retry=Mock())
         return method, ns, backend
 
     def test_actual_method_scopes_http1_and_closes_response_once(self):
@@ -202,6 +206,58 @@ class StreamTests(unittest.TestCase):
         self.assertIsNone(row["headersMs"])
         self.assertEqual(row["curlCode"], 92)
         self.assertNotIn("sensitive", json.dumps(row))
+
+    def test_actual_method_recovers_by_read_back_after_curl92_without_replay(self):
+        for enabled in [False, True]:
+            method, ns, backend = self.backend(enabled)
+
+            def broken():
+                yield '{"conversation_id":"c1","v":{}}'
+                raise RequestException("curl: (92) HTTP/2 stream 7 was not closed cleanly", code=92)
+            response = Mock(http_version=2)
+            ns["iter_sse_payloads"] = lambda response, **kwargs: broken()
+            backend.session.post.return_value = response
+            backend._find_search_value = lambda payload, key: "c1" if "c1" in payload else ""
+            backend._recover_web_text = Mock(return_value=iter(['{"message":{"x":1}}', "[DONE]"]))
+            out = list(method(backend, [{"content": "private"}], "gpt-6", object(), "xhigh"))
+            self.assertEqual(out[-2:], ['{"message":{"x":1}}', "[DONE]"])
+            backend.session.post.assert_called_once()
+            self.assertEqual(backend._recover_web_text.call_args.args[0], "c1")
+            response.close.assert_called_once()
+            backend._hide_web_text_conversation.assert_called_once()
+
+    def test_actual_method_without_conversation_id_stays_unknown(self):
+        method, ns, backend = self.backend(False)
+
+        def broken():
+            yield '{"v":"x"}'
+            raise RequestException("curl: (92)", code=92)
+        ns["iter_sse_payloads"] = lambda response, **kwargs: broken()
+        backend.session.post.return_value = Mock(http_version=2)
+        backend._recover_web_text = Mock()
+        with self.assertRaises(WebTextNoConversation) as caught:
+            list(method(backend, [{"content": "private"}], "gpt-6", object()))
+        self.assertEqual(caught.exception.to_openai_error()["error"]["code"], "upstream_outcome_unknown_no_conversation")
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertEqual(caught.exception.curl_code, 92)
+        backend._recover_web_text.assert_not_called()
+        backend.session.post.assert_called_once()
+
+    def test_actual_method_post_break_without_conversation_id_is_marked_and_not_replayed(self):
+        method, ns, backend = self.backend(False)
+        backend.session.post.side_effect = RequestException("curl: (92) HTTP/2 stream 1 was not closed cleanly", code=92)
+        with self.assertRaises(WebTextNoConversation):
+            list(method(backend, [{"content": "private"}], "gpt-6", object()))
+        backend.session.post.assert_called_once()
+
+    def test_http_status_errors_are_not_marked_no_conversation(self):
+        method, ns, backend = self.backend(False)
+        err = RuntimeError("HTTP 403")
+        err.status_code = 403
+        backend.session.post.side_effect = err
+        with self.assertRaises(RuntimeError) as caught:
+            list(method(backend, [{"content": "private"}], "gpt-6", object()))
+        self.assertNotIsInstance(caught.exception, WebTextNoConversation)
 
     def test_actual_method_incomplete_eof_closes_and_fails(self):
         method, ns, backend = self.backend()

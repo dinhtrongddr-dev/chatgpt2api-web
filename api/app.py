@@ -122,6 +122,20 @@ def create_app() -> FastAPI:
         expose_headers=["X-Export-Requested", "X-Exported", "X-Skipped"],
     )
     app.include_router(ai.create_router())
+    # Opt-in only: existing text/image/Anthropic clients retain their exact routes.
+    import os
+    if os.environ.get("CHATGPT2API_STUDIO_RECEIPTS") == "1":
+        # Optional private dependency directory keeps the uv-managed runtime intact.
+        dependency_dir = os.environ.get("CHATGPT2API_STUDIO_RECEIPT_DEPS", "").strip()
+        if dependency_dir:
+            import sys
+            from pathlib import Path
+            dependency_path = Path(dependency_dir)
+            if not dependency_path.is_absolute() or dependency_path.is_symlink():
+                raise RuntimeError("RECEIPT_DEPENDENCY_DIRECTORY_INVALID")
+            sys.path.append(str(dependency_path.resolve(strict=True)))
+        from services.studio_receipt_runtime import configured_router
+        app.include_router(configured_router())
     app.include_router(accounts.create_router())
     app.include_router(image_tasks.create_router())
     app.include_router(prompts.create_router())

@@ -1,0 +1,2 @@
+# Optional opt-in receipt encryption; install only in approved deployment runtime.
+cryptography>=46,<51

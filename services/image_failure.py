@@ -672,6 +672,10 @@ def classify_image_exception(exc: BaseException, *, code: str | None = None) -> 
         return remember(image_failure(structured_code, raw_detail=str(exc)))
     if code:
         return remember(image_failure(code, raw_detail=str(exc)))
+    # curl92 means an interrupted HTTP/2 stream, not evidence of bad credentials.
+    # The upstream request may already be accepted; never classify it retryable.
+    if isinstance(exc, curl_exceptions.RequestException) and getattr(exc, "code", None) == 92:
+        return remember(image_failure("http2_stream_interrupted", raw_detail=str(exc)))
     if isinstance(exc, (TimeoutError, curl_exceptions.Timeout)):
         return remember(image_failure("upstream_connection_timeout", raw_detail=str(exc)))
     if isinstance(

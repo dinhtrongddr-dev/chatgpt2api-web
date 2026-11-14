@@ -663,3 +663,22 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
         if b64_json:
             markdown_images.append(f"![image_{index}](data:image/png;base64,{b64_json})")
     return "\n\n".join(markdown_images) if markdown_images else "Image generation completed."
+
+def capture_sse_payloads(payloads: Iterator[str], label: str = "") -> Iterator[str]:
+    """Diagnosis only (2026-11-12): when CHATGPT2API_SSE_CAPTURE_DIR is set, append every raw SSE
+    payload of a text conversation to one file per request. Off by default; contents are never logged."""
+    import os as _os
+    directory = _os.environ.get("CHATGPT2API_SSE_CAPTURE_DIR", "").strip()
+    if not directory:
+        yield from payloads
+        return
+    import re as _re
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    safe = _re.sub(r"[^A-Za-z0-9_.-]", "_", label)[:80] or "request"
+    target = path / f"{time.strftime('%Y%m%dT%H%M%S')}-{safe}.sse.jsonl"
+    with open(target, "a", encoding="utf-8") as handle:
+        for payload in payloads:
+            handle.write(payload.replace("\n", "\\n") + "\n")
+            handle.flush()
+            yield payload
