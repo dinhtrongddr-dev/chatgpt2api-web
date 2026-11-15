@@ -76,12 +76,14 @@ if (-not (Test-Path $envFile)) {
     $bytes = New-Object byte[] 24
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $key = 'sk-' + ([Convert]::ToBase64String($bytes) -replace '[+/=]', 'x')
-    @(
+    # no BOM: Windows PowerShell's "UTF8" adds one, and a BOM hid the key from tray.py, which then
+    # appended a second, different key (the app was wired to the first one -> HTTP 401)
+    [System.IO.File]::WriteAllLines($envFile, [string[]]@(
         "CHATGPT2API_AUTH_KEY=$key",
         'CHATGPT2API_PORT=13000',
         'CHATGPT2API_HOST=127.0.0.1',
         'TZ=Asia/Ho_Chi_Minh'
-    ) | Set-Content -Encoding UTF8 $envFile
+    ), (New-Object System.Text.UTF8Encoding($false)))
     Write-Host 'Da tao .env voi auth key ngau nhien (127.0.0.1:13000).'
 } else {
     Write-Host '.env da co: giu nguyen.'

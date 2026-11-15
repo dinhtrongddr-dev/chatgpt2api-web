@@ -165,7 +165,7 @@ def _new_auth_key() -> str:
 def _ensure_auth_key_in_env() -> str:
     """No key is ever hard-coded: the first start writes a random one into .env."""
     key = _new_auth_key()
-    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    lines = ENV_FILE.read_text(encoding="utf-8-sig").splitlines() if ENV_FILE.exists() else []
     lines = [ln for ln in lines if not ln.strip().startswith("CHATGPT2API_AUTH_KEY=")]
     lines.append(f"CHATGPT2API_AUTH_KEY={key}")
     ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -180,7 +180,7 @@ def load_config():
 
     if ENV_FILE.exists():
         try:
-            with open(ENV_FILE, "r", encoding="utf-8") as f:
+            with open(ENV_FILE, "r", encoding="utf-8-sig") as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"):
