@@ -68,7 +68,8 @@ if ($py -eq $bundled) {
 if ($LASTEXITCODE -ne 0) {
     & $target -m pip install -r (Join-Path $Root 'requirements.txt') --force-reinstall --quiet
 }
-& $target -c "import fastapi, uvicorn, curl_cffi, sqlalchemy, tiktoken, PIL; print('Thu vien: OK')"
+& $target -c "import fastapi, uvicorn, curl_cffi, sqlalchemy, tiktoken, PIL, pystray, tkinter; print('Thu vien: OK')"
+if ($LASTEXITCODE -ne 0) { throw 'Thieu thu vien (xem dong loi o tren): chay lai setup.ps1.' }
 
 $envFile = Join-Path $Root '.env'
 if (-not (Test-Path $envFile)) {
