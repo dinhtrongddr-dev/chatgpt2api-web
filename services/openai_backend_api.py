@@ -44,7 +44,8 @@ from services.web_text_transport import (
     WebTextOutcomeUnknown, WebTextStreamAudit, checked_payloads, isolated_http1_enabled,
 )
 from services.web_text_recovery import (
-    WebTextNoConversation, WebTextRecoveryFailed, curl_code_of, is_transport_error, recover_assistant_message, run_predispatch,
+    WebTextNoConversation, WebTextRecoveryFailed, WebTextUpstreamFailedVerified, curl_code_of, is_transport_error,
+    is_upstream_error_payload, read_back_after_upstream_error, recover_assistant_message, run_predispatch,
 )
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
@@ -1049,6 +1050,12 @@ class OpenAIBackendAPI:
                         done_seen = True
                     elif not conversation_id:
                         conversation_id = self._find_search_value(payload_item, "conversation_id")
+                    if not done_seen and conversation_id and is_upstream_error_payload(payload_item):
+                        # Studio plan V3.8 U3 (owner 17/11): read the turn back instead of ending UNKNOWN.
+                        response.close()
+                        response = None
+                        yield from self._read_back_after_error(conversation_id, payload_item, "f-conversation")
+                        return
                     yield payload_item
             except Exception as stream_exc:
                 if done_seen or not conversation_id or not is_transport_error(stream_exc):
@@ -1121,6 +1128,33 @@ class OpenAIBackendAPI:
                 raise cause
             raise ConnectionError("UPSTREAM_OUTCOME_UNKNOWN: stream ended without [DONE]; recovery failed") from failure
         logger.info({"event": "web_text_stream_recovered", "protocol": protocol,
+                     "elapsed_ms": int((time.monotonic() - started) * 1000)})
+        yield json.dumps({"message": message, "conversation_id": conversation_id}, ensure_ascii=False)
+        yield "[DONE]"
+
+    def _read_back_after_error(self, conversation_id: str, error_payload: str, protocol: str) -> Iterator[str]:
+        """chatgpt.com sent an error event after the conversation existed. GET only, never a replay.
+
+        A finished answer is yielded as if streamed; a verified failure raises WebTextUpstreamFailedVerified; when the
+        read-back cannot decide, the original error event is passed on unchanged (the outcome stays UNKNOWN).
+        """
+        started = time.monotonic()
+        logger.warning({"event": "web_text_upstream_error_readback_started", "protocol": protocol})
+        try:
+            message = read_back_after_upstream_error(
+                lambda cid: self._get_conversation(cid, timeout_secs=30),
+                conversation_id,
+                deadline=started + 300,
+            )
+        except WebTextUpstreamFailedVerified as failed:
+            logger.warning({"event": "web_text_upstream_error_verified_no_answer", "protocol": protocol, "reason": failed.reason,
+                            "elapsed_ms": int((time.monotonic() - started) * 1000)})
+            raise
+        except WebTextRecoveryFailed as failure:
+            logger.warning({"event": "web_text_upstream_error_readback_failed", "protocol": protocol, "reason": str(failure)})
+            yield error_payload
+            return
+        logger.info({"event": "web_text_upstream_error_recovered", "protocol": protocol,
                      "elapsed_ms": int((time.monotonic() - started) * 1000)})
         yield json.dumps({"message": message, "conversation_id": conversation_id}, ensure_ascii=False)
         yield "[DONE]"

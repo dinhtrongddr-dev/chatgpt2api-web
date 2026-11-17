@@ -158,3 +158,92 @@ def recover_assistant_message(fetch: Callable[[str], dict], conversation_id: str
         if remaining <= 0:
             raise WebTextRecoveryFailed("recovery deadline reached" + (f" ({last_error})" if last_error else ""))
         sleep(min(poll_secs, remaining))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 2026-11-17 (owner-authorized, Studio plan V3.8 section 10, U3): chatgpt.com can send an error event inside an
+# HTTP 200 stream after the conversation exists. That used to end as UNKNOWN (UPSTREAM_SSE_ERROR_UNVERIFIED) and the
+# Studio waited 30 minutes, then threw the project away. The turn is now read back (GET only, never a replay):
+#   - a finished visible answer is returned as if streamed;
+#   - an assistant turn that ended without a complete answer, or no assistant turn at all over `stable_reads`
+#     consecutive successful reads, is a verified failure (no answer was produced) that the client may run again;
+#   - anything else (reads refused, not found, still in progress at the deadline) stays UNKNOWN.
+
+class WebTextUpstreamFailedVerified(RuntimeError):
+    """chatgpt.com ended the turn with an error and the read-back shows no answer."""
+
+    def __init__(self, reason: str):
+        self.code = "upstream_failed_verified_no_answer"
+        self.reason = reason
+        super().__init__("UPSTREAM_FAILED_VERIFIED: chatgpt.com ended the turn with an error; read-back shows no answer ("
+                         + reason + "); safe to run again")
+
+    def to_openai_error(self) -> dict:
+        return {"error": {"message": str(self), "type": "server_error", "code": self.code}}
+
+
+def is_upstream_error_payload(payload: Any) -> bool:
+    """The same test the conversation parser uses for UPSTREAM_SSE_ERROR_UNVERIFIED (usage limits excluded)."""
+    if not isinstance(payload, str) or not payload or payload == "[DONE]":
+        return False
+    try:
+        import json
+        event = json.loads(payload)
+    except ValueError:
+        return False
+    if not isinstance(event, dict):
+        return False
+    error = event.get("error")
+    nested = (error.get("code") or error.get("error_code")) if isinstance(error, dict) else None
+    if event.get("error_code") == "usage_limit" or event.get("code") == "usage_limit" or nested == "usage_limit":
+        return False
+    return bool(error) and not event.get("message") and not event.get("p")
+
+
+def _latest_role(conversation: dict) -> str:
+    mapping = conversation.get("mapping") if isinstance(conversation, dict) else None
+    node_id = conversation.get("current_node") if isinstance(conversation, dict) else None
+    if not isinstance(mapping, dict) or not node_id or node_id not in mapping:
+        return ""
+    message = (mapping[node_id] or {}).get("message") or {}
+    return str((message.get("author") or {}).get("role") or "").lower()
+
+
+def read_back_after_upstream_error(fetch: Callable[[str], dict], conversation_id: str, deadline: float, *,
+                                   now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                                   poll_secs: float = 5.0, stable_reads: int = 3) -> dict:
+    """GET only. Returns the finished assistant message, or raises WebTextUpstreamFailedVerified / WebTextRecoveryFailed."""
+    missing = 0
+    no_assistant = 0
+    last_error = ""
+    while True:
+        try:
+            conversation = fetch(conversation_id)
+            missing = 0
+            state, message = final_assistant_state(conversation)
+            if state == "done" and message is not None:
+                return message
+            if state == "failed":
+                raise WebTextUpstreamFailedVerified("assistant turn ended without a complete answer")
+            if _latest_role(conversation) in {"user", "system"}:
+                no_assistant += 1
+                if no_assistant >= stable_reads:
+                    raise WebTextUpstreamFailedVerified("no assistant turn after the error")
+            else:
+                no_assistant = 0
+        except (WebTextUpstreamFailedVerified, WebTextRecoveryFailed):
+            raise
+        except Exception as exc:
+            no_assistant = 0
+            status = getattr(exc, "status_code", None)
+            if status in (401, 403):
+                raise WebTextRecoveryFailed(f"conversation read refused: HTTP {status}") from exc
+            if status == 404:
+                missing += 1
+                if missing >= 3:
+                    raise WebTextRecoveryFailed("conversation not found") from exc
+            last_error = type(exc).__name__
+        remaining = deadline - now()
+        if remaining <= 0:
+            raise WebTextRecoveryFailed("read-back deadline reached" + (f" ({last_error})" if last_error else ""))
+        sleep(min(poll_secs, remaining))

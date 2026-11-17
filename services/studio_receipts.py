@@ -202,6 +202,12 @@ class ReceiptEngine:
             # upstream_not_dispatched: no conversation POST left the gateway -> verified failure, safe to run again.
             # upstream_outcome_unknown_no_conversation with no visible frame: keep that code; its 502 status must not hide it.
             native_code=getattr(exc,'code',None)
+            # 2026-11-17 (owner-authorized, Studio plan V3.8 U3): chatgpt.com ended the turn with an error and the
+            # read-back proved no answer was produced -> verified failure; the client may run the step again.
+            if native_code=='upstream_failed_verified_no_answer':
+                try:self.store.update(row,status='FAILED_VERIFIED',phase='UPSTREAM_ERROR_VERIFIED',error_type='VERIFIED_UPSTREAM_ERROR_NO_ANSWER',frames=state['frames'])
+                except Exception:pass
+                return
             if native_code=='upstream_not_dispatched':
                 try:self.store.update(row,status='FAILED_VERIFIED',phase='REJECTED_PRE_DISPATCH',error_type='VERIFIED_NO_NATIVE_SUBMIT',native_count=0,frames=state['frames'])
                 except Exception:pass

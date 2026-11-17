@@ -7,7 +7,7 @@ import time
 import unittest
 
 from services.studio_receipts import ReceiptEngine
-from services.web_text_recovery import WebTextNoConversation, WebTextNotDispatched
+from services.web_text_recovery import WebTextNoConversation, WebTextNotDispatched, WebTextUpstreamFailedVerified
 
 
 class FakeStore:
@@ -67,6 +67,14 @@ class ReceiptClassificationTest(unittest.TestCase):
     def test_other_502_stays_generic_unknown(self):
         store = run(raising(Http502('bad gateway')))
         self.assertEqual(store.updates[-1]['error_type'], 'UPSTREAM_HTTP_502')
+
+    def test_upstream_error_with_no_answer_is_a_verified_failure(self):
+        # 2026-11-17 (Studio plan V3.8 U3): the read-back after chatgpt.com's error event found no answer.
+        store = run(raising(WebTextUpstreamFailedVerified('no assistant turn after the error')))
+        last = store.updates[-1]
+        self.assertEqual((last['status'], last['phase'], last['error_type']),
+                         ('FAILED_VERIFIED', 'UPSTREAM_ERROR_VERIFIED', 'VERIFIED_UPSTREAM_ERROR_NO_ANSWER'))
+        self.assertEqual(store.released, 1)
 
 
 if __name__ == '__main__':

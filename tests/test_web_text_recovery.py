@@ -120,3 +120,58 @@ class PredispatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpstreamErrorReadBackTests(unittest.TestCase):
+    """2026-11-17 (Studio plan V3.8 U3): an error event inside the stream is read back, never replayed."""
+
+    def run_reads(self, reads, deadline=300.0):
+        from services.web_text_recovery import read_back_after_upstream_error
+        seq = iter(reads)
+        clock = {"t": 0.0}
+
+        def fetch(_cid):
+            item = next(seq)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return read_back_after_upstream_error(fetch, "c1", deadline, now=lambda: clock["t"],
+                                              sleep=lambda s: clock.__setitem__("t", clock["t"] + s))
+
+    def test_payload_detection(self):
+        from services.web_text_recovery import is_upstream_error_payload
+        self.assertTrue(is_upstream_error_payload('{"error": "Something went wrong"}'))
+        self.assertTrue(is_upstream_error_payload('{"error": {"code": "server_error"}}'))
+        self.assertFalse(is_upstream_error_payload('{"error": {"code": "usage_limit"}}'))
+        self.assertFalse(is_upstream_error_payload('{"error": "x", "message": {"id": "m"}}'))
+        self.assertFalse(is_upstream_error_payload('{"p": "/message", "v": "a"}'))
+        self.assertFalse(is_upstream_error_payload("[DONE]"))
+        self.assertFalse(is_upstream_error_payload("not json"))
+
+    def test_finished_answer_is_recovered(self):
+        message = self.run_reads([conv(status="in_progress", end_turn=None), conv()])
+        self.assertEqual(message["content"]["parts"], ["答え"])
+
+    def test_no_assistant_turn_three_reads_is_verified_failure(self):
+        from services.web_text_recovery import WebTextUpstreamFailedVerified
+        with self.assertRaises(WebTextUpstreamFailedVerified) as caught:
+            self.run_reads([conv(role="user")] * 3)
+        self.assertEqual(caught.exception.code, "upstream_failed_verified_no_answer")
+
+    def test_a_read_error_resets_the_count(self):
+        from services.web_text_recovery import WebTextUpstreamFailedVerified
+        with self.assertRaises(WebTextUpstreamFailedVerified):
+            self.run_reads([conv(role="user"), conv(role="user"), HttpError(502), conv(role="user"), conv(role="user"), conv(role="user")])
+
+    def test_assistant_ended_without_answer_is_verified_failure(self):
+        from services.web_text_recovery import WebTextUpstreamFailedVerified
+        with self.assertRaises(WebTextUpstreamFailedVerified):
+            self.run_reads([conv(status="failed")])
+
+    def test_undecided_stays_unknown(self):
+        with self.assertRaises(WebTextRecoveryFailed):
+            self.run_reads([HttpError(403)])
+        with self.assertRaises(WebTextRecoveryFailed):
+            self.run_reads([HttpError(404)] * 3)
+        with self.assertRaises(WebTextRecoveryFailed):
+            self.run_reads([conv(content_type="thoughts")] * 100, deadline=20.0)
